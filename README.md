@@ -229,6 +229,10 @@ GenAI2OpenAI/
     └── prompts.py           # Tool prompt 注入
 ```
 
+## 致谢
+
+本项目基于 [HeZeBang/GenAI2OpenAI](https://github.com/HeZeBang/GenAI2OpenAI) 开发，感谢原作者的工作。
+
 ## 许可
 
 MIT License — 详见 LICENSE 文件。
