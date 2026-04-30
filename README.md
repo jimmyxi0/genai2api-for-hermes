@@ -73,10 +73,9 @@ uv run main.py --token "eyJ..."
 **手动获取 JWT：**
 
 1. 前往 [GenAI 对话平台](https://genai.shanghaitech.edu.cn/)
-2. 打开浏览器开发者工具，发送一条消息，捕获 `chat` 请求
-3. 复制请求头中的 `x-access-token` 字段
-
-![Token 获取示意](images/chrome.png)
+2. 打开浏览器开发者工具（F12），切到 Network 标签
+3. 发送一条消息，捕获 `chat` 请求
+4. 在请求头中复制 `x-access-token` 字段的值
 
 ## API 接口
 
@@ -160,27 +159,47 @@ response = client.chat.completions.create(
 
 ### Claude Code
 
-启动代理：
+1. 启动代理：
 
 ```bash
-uv run main.py --token "$GENAI_TOKEN" --port 5000 --api-format both
+uv run main.py --token "学号@密码" --port 5000 --api-format both
 ```
 
-配置 Claude Code：
+2. 设置环境变量（写入 `~/.bashrc` 或 `~/.zshrc`）：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:5000"
-export ANTHROPIC_AUTH_TOKEN="local-proxy"
+export ANTHROPIC_AUTH_TOKEN="local-proxy"   # 如果设了 --api-key，改成同一个值
 export ANTHROPIC_MODEL="chatglm"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="MiniMax-M1"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-pro"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="chatglm"
 export ANTHROPIC_REASONING_MODEL="MiniMax-M1"
-
-claude -p --model "$ANTHROPIC_MODEL" "用一句话回复：连接成功"
 ```
 
-如果启动代理时设置了 `--api-key <key>` 或 `API_KEY=<key>`，请把 `ANTHROPIC_AUTH_TOKEN` 设置成同一个值；代理同时兼容 Claude Code 常用的 `x-api-key` 和 OpenAI 常用的 `Authorization: Bearer`。
+3. 配置 Claude Code 项目设置（`.claude/settings.json`）：
+
+在项目根目录创建 `.claude/settings.json`，减少权限弹窗：
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run *)",
+      "Bash(python *)",
+      "Bash(curl *localhost*)"
+    ]
+  }
+}
+```
+
+4. 启动 Claude Code：
+
+```bash
+claude
+```
+
+代理同时兼容 Claude Code 常用的 `x-api-key` 和 OpenAI 常用的 `Authorization: Bearer`，无需额外配置。
 
 ## API Key 认证
 
