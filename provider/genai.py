@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+import time
 import uuid
 from datetime import datetime
 
@@ -8,15 +10,17 @@ import requests
 from config import GENAI_URL, build_genai_headers, model_registry
 from errors import make_error_chunk
 from tools.parsing import extract_tool_calls, _tag_prefix_len
+from tools.prompts import flatten_message_content, normalize_message_content
 
 logger = logging.getLogger(__name__)
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]")
 
 
 def convert_messages_to_genai_format(messages):
     chat_info = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            chat_info = msg.get("content", "")
+            chat_info = flatten_message_content(msg.get("content", ""))
             break
     return chat_info
 
@@ -33,14 +37,47 @@ def extract_content_from_genai(response_data):
     return None, None
 
 
+def estimate_text_tokens(text):
+    if not text:
+        return 0
+    return len(TOKEN_PATTERN.findall(text))
+
+
+def log_stream_metrics(model, started_at, first_token_at, content_text, reasoning_text):
+    total_elapsed = max(time.monotonic() - started_at, 1e-6)
+    content_tokens = estimate_text_tokens(content_text)
+    reasoning_tokens = estimate_text_tokens(reasoning_text)
+    total_tokens = content_tokens + reasoning_tokens
+
+    extra = ""
+    if first_token_at is not None:
+        ttft_ms = (first_token_at - started_at) * 1000
+        extra = f" ttft_ms={ttft_ms:.0f}"
+
+    logger.info(
+        "stream metrics model=%s est_tokens=%d content_est=%d reasoning_est=%d toks_per_s=%.2f%s",
+        model,
+        total_tokens,
+        content_tokens,
+        reasoning_tokens,
+        total_tokens / total_elapsed,
+        extra,
+    )
+
+
 def stream_genai_response(chat_info, messages, model, max_tokens, config):
+    started_at = time.monotonic()
+    first_token_at = None
+    content_parts = []
+    reasoning_parts = []
     token = config.token_manager.get_token()
     root_ai_type = model_registry.get_root_ai_type(model, token)
     headers = build_genai_headers(token)
+    normalized_messages = [normalize_message_content(msg) for msg in messages]
 
     genai_data = {
         "chatInfo": "",
-        "messages": messages,
+        "messages": normalized_messages,
         "type": "3",
         "stream": True,
         "aiType": model,
@@ -52,10 +89,10 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
 
     logger.debug("=== GenAI Request ===")
     logger.debug("Model: %s, rootAiType: %s", model, root_ai_type)
-    logger.debug("Messages count: %d", len(messages))
-    for i, msg in enumerate(messages):
+    logger.debug("Messages count: %d", len(normalized_messages))
+    for i, msg in enumerate(normalized_messages):
         role = msg.get('role', '?')
-        content = msg.get('content', '')
+        content = flatten_message_content(msg.get('content', ''))
         preview = (content[:200] + '...') if content and len(content) > 200 else content
         logger.debug("  [%d] role=%s, content=%s", i, role, preview)
 
@@ -91,6 +128,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
             return
 
         finished = False
+        emitted_done = False
         line_count = 0
         for line in response.iter_lines():
             if finished:
@@ -123,6 +161,13 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                                 finished = True
 
                         if finished:
+                            log_stream_metrics(
+                                model,
+                                started_at,
+                                first_token_at,
+                                "".join(content_parts),
+                                "".join(reasoning_parts),
+                            )
                             final_response = {
                                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
                                 "object": "chat.completion.chunk",
@@ -134,6 +179,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                                     "finish_reason": "stop"
                                 }]
                             }
+                            emitted_done = True
                             yield f"data: {json.dumps(final_response)}\n\n"
                             yield "data: [DONE]\n\n"
                             break
@@ -147,6 +193,12 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                             delta["reasoning_content"] = reasoning
 
                         if delta:
+                            if first_token_at is None:
+                                first_token_at = time.monotonic()
+                            if content:
+                                content_parts.append(content)
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
                             openai_response = {
                                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
                                 "object": "chat.completion.chunk",
@@ -165,6 +217,16 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
 
         logger.debug("Total lines received: %d, finished: %s", line_count, finished)
 
+        if emitted_done:
+            return
+
+        log_stream_metrics(
+            model,
+            started_at,
+            first_token_at,
+            "".join(content_parts),
+            "".join(reasoning_parts),
+        )
         final_response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion.chunk",
@@ -184,11 +246,11 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
         yield make_error_chunk(str(e), model)
 
 
-def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, config):
+def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, config, allowed_tool_names=None):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
 
-    OPEN_TAG = "<tool_call>"
+    OPEN_TAG = "<tool_call"
 
     buffer = ""
     tool_buffer = ""
@@ -263,7 +325,10 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
             buffer = ""
 
     if tool_detected:
-        tool_calls, remaining = extract_tool_calls(tool_buffer)
+        tool_calls, remaining = extract_tool_calls(
+            tool_buffer,
+            allowed_tool_names=allowed_tool_names,
+        )
 
         if tool_calls:
             logger.debug("Streaming tool calling: detected %d tool_call(s)", len(tool_calls))

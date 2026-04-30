@@ -16,6 +16,7 @@ class Config:
     port: int
     api_key: str | None
     debug: bool
+    api_format: str = "both"  # "openai", "anthropic", or "both"
 
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"

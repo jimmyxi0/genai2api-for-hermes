@@ -17,15 +17,19 @@ def register_auth(app):
             return
 
         auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
+        x_api_key = request.headers.get('x-api-key', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+        elif x_api_key:
+            token = x_api_key
+        else:
             return openai_error(
-                "Missing Authorization header with Bearer token",
+                "Missing Authorization Bearer token or x-api-key header",
                 error_type="invalid_request_error",
                 code="invalid_api_key",
                 status=401
             )
 
-        token = auth_header[7:]
         if token != config.api_key:
             return openai_error(
                 "Incorrect API key provided",

@@ -18,10 +18,11 @@ import sys
 parser = argparse.ArgumentParser()
 parser.add_argument('--base-url', default='http://localhost:5000')
 parser.add_argument('--model', default='GPT-4.1')
-args = parser.parse_args()
 
-BASE_URL = args.base_url
-MODEL = args.model
+__test__ = False
+
+BASE_URL = 'http://localhost:5000'
+MODEL = 'GPT-4.1'
 
 # 定义测试用的 tools
 WEATHER_TOOL = {
@@ -439,6 +440,10 @@ def test_tag_prefix_detection():
 
 
 if __name__ == '__main__':
+    args = parser.parse_args()
+    BASE_URL = args.base_url
+    MODEL = args.model
+
     print(f"Testing against: {BASE_URL}")
     print(f"Model: {MODEL}")
 

@@ -11,6 +11,7 @@ from tools.prompts import inject_tool_prompt
 from tools.parsing import extract_tool_calls
 from provider.genai import (
     convert_messages_to_genai_format,
+    estimate_text_tokens,
     stream_genai_response,
     stream_genai_response_with_tools,
 )
@@ -40,6 +41,11 @@ def chat_completions():
         tool_choice = req_data.get('tool_choice', None)
 
         has_tools = tools and len(tools) > 0
+        allowed_tool_names = {
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function" and tool.get("function", {}).get("name")
+        }
 
         logger.info("[%s] model=%s stream=%s tools=%s messages=%d",
                      request_id, model, stream, bool(has_tools), len(messages))
@@ -55,7 +61,7 @@ def chat_completions():
         if stream:
             if has_tools:
                 gen = stream_genai_response_with_tools(
-                    chat_info, messages, model, max_tokens, config
+                    chat_info, messages, model, max_tokens, config, allowed_tool_names
                 )
             else:
                 gen = stream_genai_response(
@@ -91,7 +97,10 @@ def chat_completions():
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
             if has_tools:
-                tool_calls, remaining_text = extract_tool_calls(complete_content)
+                tool_calls, remaining_text = extract_tool_calls(
+                    complete_content,
+                    allowed_tool_names=allowed_tool_names,
+                )
             else:
                 tool_calls, remaining_text = None, complete_content
 
@@ -121,8 +130,8 @@ def chat_completions():
                 }],
                 "usage": {
                     "prompt_tokens": 0,
-                    "completion_tokens": len(complete_content),
-                    "total_tokens": len(complete_content)
+                    "completion_tokens": estimate_text_tokens(complete_content),
+                    "total_tokens": estimate_text_tokens(complete_content)
                 }
             }
             return jsonify(response)
