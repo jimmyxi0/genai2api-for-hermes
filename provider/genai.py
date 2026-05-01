@@ -15,6 +15,22 @@ from tools.prompts import flatten_message_content, normalize_message_content
 logger = logging.getLogger(__name__)
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]")
 
+# Incremental tool detection markers (lowercase)
+TOOL_MARKER_PATTERNS = [
+    "<tool_call",
+    "<tool_calls",
+    "<invoke",
+    "<tool_call>",          # thinking/parameter tag
+    "<|dsml",
+    "ｰ",           # fullwidth horizontal bar used in DSML
+]
+
+# How many chars to buffer before deciding "this is probably text, not tools"
+DETECTION_WINDOW = 512
+
+# Max chars to buffer when we've detected a tool call marker (safety cap)
+MAX_TOOL_BUFFER = 65536
+
 
 def convert_messages_to_genai_format(messages):
     chat_info = ""
@@ -65,6 +81,30 @@ def log_stream_metrics(model, started_at, first_token_at, content_text, reasonin
     )
 
 
+def _has_tool_marker(text):
+    """Check if text contains any tool call marker."""
+    lower = text.lower()
+    for marker in TOOL_MARKER_PATTERNS:
+        if marker in lower:
+            return True
+    # Also check for JSON-style tool patterns
+    if '{"name"' in text and '"function"' in text:
+        return True
+    return False
+
+
+def _has_partial_tool_marker(text):
+    """Check if text *ends* with a partial tool marker that could complete on next chunk."""
+    tail = text[-32:] if len(text) > 32 else text
+    lower_tail = tail.lower()
+    for marker in TOOL_MARKER_PATTERNS:
+        # Check if the tail is a prefix of the marker, or the marker starts in the tail
+        for i in range(len(marker)):
+            if lower_tail.endswith(marker[:i + 1]) and i < len(marker) - 1:
+                return True
+    return False
+
+
 def stream_genai_response(chat_info, messages, model, max_tokens, config):
     started_at = time.monotonic()
     first_token_at = None
@@ -102,7 +142,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
             headers=headers,
             json=genai_data,
             stream=True,
-            timeout=60
+            timeout=120
         )
 
         logger.debug("GenAI Response Status: %d", response.status_code)
@@ -114,7 +154,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                 headers = build_genai_headers(new_token)
                 response = requests.post(
                     GENAI_URL, headers=headers, json=genai_data,
-                    stream=True, timeout=60
+                    stream=True, timeout=120
                 )
 
         if response.status_code != 200:
@@ -246,38 +286,136 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
         yield make_error_chunk(str(e), model)
 
 
-def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, config, allowed_tool_names=None):
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    created = int(datetime.now().timestamp())
+def _emit_text_chunk(completion_id, created, model, text):
+    """Emit an OpenAI streaming text chunk."""
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": text},
+            "finish_reason": None
+        }]
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
 
-    OPEN_TAG = "<tool_call"
 
-    buffer = ""
-    tool_buffer = ""
-    sent_role = False
-    tool_detected = False
+def _emit_tool_call_chunks(completion_id, created, model, tool_calls, remaining=None):
+    """Emit OpenAI streaming chunks for tool calls."""
+    chunks = []
+    # Emit role first
+    role_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": None
+        }]
+    }
+    chunks.append(f"data: {json.dumps(role_chunk)}\n\n")
 
-    def make_chunk(delta, finish_reason=None):
-        chunk = {
+    for i, tc in enumerate(tool_calls):
+        tc_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason
+                "delta": {
+                    "tool_calls": [{
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"]
+                        }
+                    }]
+                },
+                "finish_reason": None
             }]
         }
-        return f"data: {json.dumps(chunk)}\n\n"
+        chunks.append(f"data: {json.dumps(tc_chunk)}\n\n")
 
-    def emit_text(text):
+    if remaining and remaining.strip():
+        chunks.append(_emit_text_chunk(completion_id, created, model, remaining.strip()))
+
+    # Finish
+    finish_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+        }]
+    }
+    chunks.append(f"data: {json.dumps(finish_chunk)}\n\n")
+    chunks.append("data: [DONE]\n\n")
+    return chunks
+
+
+def _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names):
+    """Try to extract tool calls from buffer. Returns (tool_calls, remaining) or (None, None)."""
+    if not _has_tool_marker(buffer):
+        return None, None
+
+    tool_calls, remaining = extract_tool_calls(buffer, allowed_tool_names=allowed_tool_names)
+
+    if not tool_calls:
+        # Retry with no name filter
+        tool_calls, remaining = extract_tool_calls(buffer, allowed_tool_names=None)
+
+    return tool_calls, remaining
+
+
+def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, config, allowed_tool_names=None):
+    """Stream GenAI response with incremental tool detection.
+
+    Strategy:
+    - Phase 1 (detection): Buffer up to DETECTION_WINDOW chars while checking for tool markers.
+      If markers found, switch to tool-buffering mode.
+      If no markers after the window, flush buffer as text and switch to streaming mode.
+    - Phase 2a (streaming): Stream text chunks directly. If a partial tool marker appears at
+      the tail of a chunk, hold it back for the next chunk.
+    - Phase 2b (tool-buffering): Continue buffering until tool call is complete, then emit
+      tool_call chunks. Safety cap at MAX_TOOL_BUFFER.
+    - On stream end: flush any remaining buffer appropriately.
+    """
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(datetime.now().timestamp())
+
+    # States: "detecting" -> "streaming" or "tool_buffering"
+    state = "detecting"
+    buffer = ""
+    sent_role = False
+    tool_detected = False
+
+    def _send_role():
         nonlocal sent_role
-        delta = {"content": text}
         if not sent_role:
-            delta["role"] = "assistant"
             sent_role = True
-        return make_chunk(delta)
+            role_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None
+                }]
+            }
+            return f"data: {json.dumps(role_chunk)}\n\n"
+        return None
 
     for line in stream_genai_response(chat_info, messages, model, max_tokens, config):
         if not line.startswith("data: "):
@@ -291,81 +429,162 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
             continue
         if "choices" not in data or not data["choices"]:
             continue
+
         chunk_delta = data["choices"][0].get("delta", {})
         content = chunk_delta.get("content", "")
+        finish_reason = data["choices"][0].get("finish_reason")
+
         if not content:
+            # Handle finish_reason from upstream (e.g., "stop")
+            if finish_reason:
+                break
             continue
 
-        if tool_detected:
-            tool_buffer += content
+        if state == "detecting":
+            buffer += content
+
+            # Check if we have a tool marker
+            if _has_tool_marker(buffer):
+                tool_detected = True
+                state = "tool_buffering"
+                logger.debug("Tool marker detected in detection window, switching to tool_buffering (buf=%d chars)", len(buffer))
+                continue
+
+            # Check if buffer exceeds detection window and no marker yet
+            if len(buffer) >= DETECTION_WINDOW:
+                # No tool markers — this is probably plain text.
+                # Flush the buffer as text and switch to streaming mode.
+                state = "streaming"
+                logger.debug("No tool markers in %d chars, flushing as text, switching to streaming", len(buffer))
+                role_chunk = _send_role()
+                if role_chunk:
+                    yield role_chunk
+                yield _emit_text_chunk(completion_id, created, model, buffer)
+                buffer = ""
+                continue
+
+            # Still within detection window, keep buffering
             continue
 
-        buffer += content
+        elif state == "streaming":
+            # In streaming mode, check for tool markers in new content
+            if _has_tool_marker(content):
+                # Tool marker appeared mid-stream! Switch to tool buffering.
+                # We need to re-combine: previously emitted text + new content
+                # Since we already emitted text, we can't un-emit it.
+                # Best approach: buffer from this point onward and try to extract
+                # the tool call from the buffered portion.
+                tool_detected = True
+                state = "tool_buffering"
+                buffer = content  # start fresh buffer from the marker point
+                logger.debug("Tool marker appeared mid-stream at %d chars, switching to tool_buffering", len(content))
+                continue
 
-        tag_pos = buffer.find(OPEN_TAG)
-        if tag_pos >= 0:
-            pre = buffer[:tag_pos]
-            if pre.strip():
-                yield emit_text(pre)
+            # Check if the tail of content has a partial marker
+            if _has_partial_tool_marker(content):
+                # Hold back the suspicious tail
+                safe_len = len(content) - 32
+                if safe_len > 0:
+                    yield _emit_text_chunk(completion_id, created, model, content[:safe_len])
+                    buffer = content[safe_len:]
+                    # Don't change state yet — wait for next chunk
+                    # Actually, we need a "pending" mini-state. Let's keep it simple:
+                    # just keep buffer and check next chunk.
+                    continue
+                else:
+                    buffer = content
+                    continue
 
-            tool_detected = True
-            tool_buffer = buffer[tag_pos:]
-            buffer = ""
-            continue
-
-        plen = _tag_prefix_len(buffer, OPEN_TAG)
-        if plen > 0:
-            safe = buffer[:-plen]
-            if safe:
-                yield emit_text(safe)
-            buffer = buffer[-plen:]
-        else:
+            # If we had a held-back tail, prepend it
             if buffer:
-                yield emit_text(buffer)
-            buffer = ""
+                content = buffer + content
+                buffer = ""
 
-    if tool_detected:
-        tool_calls, remaining = extract_tool_calls(
-            tool_buffer,
-            allowed_tool_names=allowed_tool_names,
-        )
+            yield _emit_text_chunk(completion_id, created, model, content)
 
-        if tool_calls:
-            logger.debug("Streaming tool calling: detected %d tool_call(s)", len(tool_calls))
+        elif state == "tool_buffering":
+            buffer += content
 
-            if remaining and remaining.strip():
-                yield emit_text(remaining.strip())
+            # Safety cap: if buffer grows too large without completing, emit as text
+            if len(buffer) > MAX_TOOL_BUFFER:
+                logger.warning("Tool buffer exceeded %d chars, flushing as text", MAX_TOOL_BUFFER)
+                role_chunk = _send_role()
+                if role_chunk:
+                    yield role_chunk
+                yield _emit_text_chunk(completion_id, created, model, buffer)
+                buffer = ""
+                state = "streaming"
+                tool_detected = False
+                continue
 
-            if not sent_role:
-                yield make_chunk({"role": "assistant"})
-                sent_role = True
+            # Try to parse tool calls from buffer
+            tool_calls, remaining = _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names)
+            if tool_calls:
+                logger.debug("Parsed %d tool_call(s) from buffer (%d chars)", len(tool_calls), len(buffer))
+                role_chunk = _send_role()
+                if role_chunk:
+                    yield role_chunk
+                for chunk in _emit_tool_call_chunks(completion_id, created, model, tool_calls, remaining):
+                    yield chunk
+                return  # Done — tool calls emitted
 
-            for i, tc in enumerate(tool_calls):
-                yield make_chunk({
-                    "tool_calls": [{
-                        "index": i,
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["function"]["name"],
-                            "arguments": tc["function"]["arguments"]
-                        }
-                    }]
-                })
+            # Not yet complete, keep buffering
+            continue
 
-            yield make_chunk({}, finish_reason="tool_calls")
-            yield "data: [DONE]\n\n"
-        else:
-            logger.warning("Tool tag detected but parsing failed — emitting as text")
-            yield emit_text(tool_buffer)
-            yield make_chunk({}, finish_reason="stop")
-            yield "data: [DONE]\n\n"
-    else:
-        if buffer:
-            yield emit_text(buffer)
-
+    # Stream ended — handle remaining buffer
+    if not buffer:
         if not sent_role:
-            yield make_chunk({"role": "assistant", "content": ""})
-
-        yield make_chunk({}, finish_reason="stop")
+            role_chunk = _send_role()
+            if role_chunk:
+                yield role_chunk
+            yield _emit_text_chunk(completion_id, created, model, "")
+        # Emit stop
+        stop_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(stop_chunk)}\n\n"
         yield "data: [DONE]\n\n"
+        return
+
+    if state == "tool_buffering" or tool_detected:
+        # Try one final parse
+        tool_calls, remaining = _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names)
+        if tool_calls:
+            logger.debug("Final parse: %d tool_call(s) from buffer (%d chars)", len(tool_calls), len(buffer))
+            role_chunk = _send_role()
+            if role_chunk:
+                yield role_chunk
+            for chunk in _emit_tool_call_chunks(completion_id, created, model, tool_calls, remaining):
+                yield chunk
+            return
+
+        # Failed to parse as tools — emit as text
+        logger.debug("Tool buffering ended without valid parse, emitting %d chars as text", len(buffer))
+
+    # Emit buffer as text
+    role_chunk = _send_role()
+    if role_chunk:
+        yield role_chunk
+    yield _emit_text_chunk(completion_id, created, model, buffer)
+
+    stop_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    }
+    yield f"data: {json.dumps(stop_chunk)}\n\n"
+    yield "data: [DONE]\n\n"

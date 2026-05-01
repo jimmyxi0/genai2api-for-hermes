@@ -24,6 +24,23 @@ THINK_OPEN_PREFIX = "<think"
 THINK_CLOSE = "</think>"
 
 
+# Incremental tool detection markers (lowercase)
+TOOL_MARKER_PATTERNS = [
+    "<tool_call",
+    "<tool_calls",
+    "<invoke",
+    "<tool_call>",          # thinking/parameter tag
+    "<|dsml",
+    "ｰ",           # fullwidth horizontal bar used in DSML
+]
+
+# How many chars to buffer before deciding "this is probably text, not tools"
+DETECTION_WINDOW = 512
+
+# Max chars to buffer when we've detected a tool call marker (safety cap)
+MAX_TOOL_BUFFER = 65536
+
+
 def anthropic_content_to_text(content: Any) -> str:
     """Convert Anthropic content format to plain text."""
     if isinstance(content, str):
@@ -178,7 +195,7 @@ def anthropic_message_to_genai_messages(message: Dict[str, Any]) -> List[Dict[st
                 "name": tool_use.get("name", ""),
                 "arguments": tool_use.get("input", {}),
             }
-            content += f"\n<tool_call>\n{json.dumps(call_obj, ensure_ascii=False)}\n</tool_call>"
+            content += f"\n<tool_call>\n{json.dumps(call_obj, ensure_ascii=False)}\n</arg_value>"
         return [{"role": "assistant", "content": content.strip()}]
 
     return [{"role": role, "content": text}]
@@ -237,9 +254,9 @@ def extract_content_from_genai(response_data: Dict[str, Any]) -> Tuple[Optional[
 
 
 def filter_thinking_and_dsml(text: str) -> str:
-    """Filter out <think>...</think> and DSML tool tags."""
+    """Filter out  aż...  and DSML tool tags."""
     # Remove thinking tags
-    text = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<think\b[^>]*>.*? ", "", text, flags=re.IGNORECASE | re.DOTALL)
 
     # Remove DSML tags
     text = re.sub(DSML_OPEN_RE, "", text, flags=re.IGNORECASE)
@@ -258,7 +275,7 @@ def partial_marker_start(text: str, position: int, marker: str) -> int:
 
 
 def filter_thinking_text_delta(text: str, state: Dict[str, Any]) -> str:
-    """Filter thinking markup even when <think> spans multiple stream chunks."""
+    """Filter thinking markup even when   spans multiple stream chunks."""
     pending = state.pop("pending_think_open", "")
     if pending:
         text = pending + text
@@ -303,7 +320,7 @@ def filter_thinking_text_delta(text: str, state: Dict[str, Any]) -> str:
 
 
 def strip_thinking_markup(text: str) -> str:
-    cleaned = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<think\b[^>]*>.*? ", "", text, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"^\s*</think>\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*<think\b[^>]*>.*$", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.strip()
@@ -439,6 +456,43 @@ def tool_input_json(tool_name: str, arguments: Any) -> str:
     return json_dumps_compact(normalize_tool_input(tool_name, arguments))
 
 
+def _has_tool_marker(text: str) -> bool:
+    """Check if text contains any tool call marker."""
+    lower = text.lower()
+    for marker in TOOL_MARKER_PATTERNS:
+        if marker in lower:
+            return True
+    # Also check for JSON-style tool patterns
+    if '{"name"' in text:
+        return True
+    # Check for plain text tool patterns like "edit>", "write>", "Bash "
+    if re.search(r'\b(bash|read|glob|grep|edit|write|ls|towrite|webfetch|websearch)\s*[>(\s]', text, re.IGNORECASE):
+        return True
+    return False
+
+
+def _has_partial_tool_marker(text: str) -> bool:
+    """Check if text *ends* with a partial tool marker that could complete on next chunk."""
+    tail = text[-32:] if len(text) > 32 else text
+    lower_tail = tail.lower()
+    for marker in TOOL_MARKER_PATTERNS:
+        for i in range(len(marker)):
+            if lower_tail.endswith(marker[:i + 1]) and i < len(marker) - 1:
+                return True
+    return False
+
+
+def _try_parse_tool_calls_from_buffer(buffer: str, allowed_tool_names: Optional[set[str]]) -> Tuple[Optional[list], Optional[str]]:
+    """Try to extract tool calls from buffer. Returns (tool_calls, remaining) or (None, None)."""
+    if not _has_tool_marker(buffer):
+        return None, None
+
+    tool_calls, remaining = extract_tool_calls(buffer, allowed_tool_names=allowed_tool_names)
+    if not tool_calls:
+        tool_calls, remaining = extract_tool_calls(buffer, allowed_tool_names=None)
+    return tool_calls, remaining
+
+
 def stream_genai_as_anthropic(
     messages: List[Dict[str, Any]],
     model: str,
@@ -447,12 +501,22 @@ def stream_genai_as_anthropic(
     config: Any,
     allowed_tool_names: Optional[set[str]] = None,
 ) -> Generator[str, None, None]:
-    """Stream GenAI response in Anthropic Messages API format."""
+    """Stream GenAI response in Anthropic Messages API format with incremental tool detection.
+
+    Strategy (same as OpenAI path):
+    - Phase 1 (detecting): Buffer up to DETECTION_WINDOW chars while checking for tool markers.
+      If markers found, switch to tool_buffering.
+      If no markers after the window, flush buffer as text and switch to streaming.
+    - Phase 2a (streaming): Stream text deltas directly. If a partial tool marker appears,
+      hold it back. If a full marker appears, switch to tool_buffering.
+    - Phase 2b (tool_buffering): Continue buffering until tool call is complete, then emit
+      tool_use blocks. Safety cap at MAX_TOOL_BUFFER.
+    - On stream end: flush any remaining buffer appropriately.
+    """
     started_at = time.monotonic()
     first_token_at = None
     content_parts: List[str] = []
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    created = int(datetime.now().timestamp())
 
     headers = build_genai_headers(token)
     root_ai_type = model_registry.get_root_ai_type(model, token)
@@ -492,14 +556,15 @@ def stream_genai_as_anthropic(
 
     text_block_started = False
     text_block_stopped = False
-    delta_count = 0
-    buffer = ""
-    tool_buffer = ""
-    tool_detected = False
     thinking_state: Dict[str, Any] = {"in_thinking": False}
 
+    # States: "detecting" -> "streaming" or "tool_buffering"
+    state = "detecting"
+    buffer = ""
+    tool_detected = False
+
     def emit_text(text: str) -> Generator[str, None, None]:
-        nonlocal first_token_at, text_block_started, delta_count
+        nonlocal first_token_at, text_block_started
         if not text:
             return
         if first_token_at is None:
@@ -512,7 +577,6 @@ def stream_genai_as_anthropic(
             })
             text_block_started = True
         content_parts.append(text)
-        delta_count += 1
         yield write_sse("content_block_delta", {
             "type": "content_block_delta",
             "index": 0,
@@ -525,13 +589,50 @@ def stream_genai_as_anthropic(
             yield write_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
             text_block_stopped = True
 
+    def emit_tool_blocks(tool_calls: list, remaining: Optional[str] = None) -> Generator[str, None, None]:
+        """Emit Anthropic tool_use content blocks."""
+        nonlocal text_block_started
+        next_index = 1 if text_block_started else 0
+        if remaining:
+            yield from emit_text(remaining)
+        yield from close_text_block()
+
+        for offset, tool_call in enumerate(tool_calls):
+            function = tool_call.get("function", {})
+            block_index = next_index + offset
+            tool_id = tool_call.get("id") or f"toolu_genai_{uuid.uuid4().hex[:24]}"
+            tool_name = function.get("name") or "tool"
+            arguments = function.get("arguments", "{}")
+            yield write_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": {},
+                },
+            })
+            yield write_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": tool_input_json(tool_name, arguments),
+                },
+            })
+            yield write_sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block_index,
+            })
+
     try:
         response = requests.post(
             GENAI_URL,
             headers=headers,
             json=genai_data,
             stream=True,
-            timeout=60
+            timeout=120
         )
 
         if response.status_code == 401:
@@ -541,7 +642,7 @@ def stream_genai_as_anthropic(
                 headers = build_genai_headers(new_token)
                 response = requests.post(
                     GENAI_URL, headers=headers, json=genai_data,
-                    stream=True, timeout=60
+                    stream=True, timeout=120
                 )
 
         if response.status_code != 200:
@@ -586,93 +687,100 @@ def stream_genai_as_anthropic(
                         if content:
                             content = filter_thinking_text_delta(content, thinking_state)
 
-                        if content:
-                            if tool_detected:
-                                tool_buffer += content
-                                continue
+                        if not content:
+                            continue
 
+                        # === Incremental streaming state machine ===
+
+                        if state == "detecting":
                             buffer += content
-                            tag_pos = buffer.find("<tool_call")
-                            if tag_pos >= 0:
-                                pre_text = buffer[:tag_pos]
-                                yield from emit_text(pre_text)
+
+                            if _has_tool_marker(buffer):
                                 tool_detected = True
-                                tool_buffer = buffer[tag_pos:]
-                                buffer = ""
+                                state = "tool_buffering"
+                                logger.debug("Anthropic: tool marker detected in detection window, switching to tool_buffering (buf=%d chars)", len(buffer))
                                 continue
 
-                            bare_tool_match = BARE_TOOL_CALL_RE.search(buffer) if allowed_tool_names else None
-                            if bare_tool_match:
-                                pre_text = buffer[:bare_tool_match.start()]
-                                yield from emit_text(pre_text)
-                                tool_detected = True
-                                tool_buffer = buffer[bare_tool_match.start():]
-                                buffer = ""
-                                continue
-
-                            if allowed_tool_names and not text_block_started and buffer.lstrip().startswith("{"):
-                                continue
-
-                            prefix_len = _tag_prefix_len(buffer, "<tool_call")
-                            if prefix_len > 0:
-                                safe_text = buffer[:-prefix_len]
-                                yield from emit_text(safe_text)
-                                buffer = buffer[-prefix_len:]
-                            else:
+                            if len(buffer) >= DETECTION_WINDOW:
+                                state = "streaming"
+                                logger.debug("Anthropic: no tool markers in %d chars, flushing as text, switching to streaming", len(buffer))
                                 yield from emit_text(buffer)
                                 buffer = ""
+                                continue
+
+                            # Still within detection window, keep buffering
+                            continue
+
+                        elif state == "streaming":
+                            if _has_tool_marker(content):
+                                tool_detected = True
+                                state = "tool_buffering"
+                                buffer = content
+                                logger.debug("Anthropic: tool marker appeared mid-stream, switching to tool_buffering")
+                                continue
+
+                            if _has_partial_tool_marker(content):
+                                safe_len = len(content) - 32
+                                if safe_len > 0:
+                                    yield from emit_text(content[:safe_len])
+                                    buffer = content[safe_len:]
+                                else:
+                                    buffer = content
+                                continue
+
+                            if buffer:
+                                content = buffer + content
+                                buffer = ""
+
+                            yield from emit_text(content)
+
+                        elif state == "tool_buffering":
+                            buffer += content
+
+                            if len(buffer) > MAX_TOOL_BUFFER:
+                                logger.warning("Anthropic: tool buffer exceeded %d chars, flushing as text", MAX_TOOL_BUFFER)
+                                yield from emit_text(buffer)
+                                buffer = ""
+                                state = "streaming"
+                                tool_detected = False
+                                continue
+
+                            tool_calls, remaining = _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names)
+                            if tool_calls:
+                                logger.debug("Anthropic: parsed %d tool_call(s) from buffer (%d chars)", len(tool_calls), len(buffer))
+                                yield from emit_tool_blocks(tool_calls, remaining)
+                                # Emit final events and return
+                                output_text = "".join(content_parts)
+                                output_tokens = max(1, len(output_text) // 4) if output_text else 0
+                                yield write_sse("message_delta", {
+                                    "type": "message_delta",
+                                    "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                                    "usage": {"output_tokens": output_tokens},
+                                })
+                                yield write_sse("message_stop", {"type": "message_stop"})
+                                return
+
+                            # Not yet complete, keep buffering
+                            continue
 
                 except json.JSONDecodeError:
                     pass
 
+        # Stream ended — handle remaining buffer
         stop_reason = "end_turn"
-        if tool_detected:
-            tool_buffer += buffer
-            buffer = ""
-            tool_calls, remaining = extract_tool_calls(
-                tool_buffer,
-                allowed_tool_names=allowed_tool_names,
-            )
-            if tool_calls:
-                if remaining:
-                    yield from emit_text(remaining)
-                yield from close_text_block()
 
-                next_index = 1 if text_block_started else 0
-                for offset, tool_call in enumerate(tool_calls):
-                    function = tool_call.get("function", {})
-                    block_index = next_index + offset
-                    tool_id = tool_call.get("id") or f"toolu_genai_{uuid.uuid4().hex[:24]}"
-                    tool_name = function.get("name") or "tool"
-                    arguments = function.get("arguments", "{}")
-                    yield write_sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": tool_name,
-                            "input": {},
-                        },
-                    })
-                    yield write_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": tool_input_json(tool_name, arguments),
-                        },
-                    })
-                    yield write_sse("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": block_index,
-                    })
-                stop_reason = "tool_use"
+        if buffer:
+            if state == "tool_buffering" or tool_detected:
+                tool_calls, remaining = _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names)
+                if tool_calls:
+                    logger.debug("Anthropic: final parse: %d tool_call(s) from buffer", len(tool_calls))
+                    yield from emit_tool_blocks(tool_calls, remaining)
+                    stop_reason = "tool_use"
+                else:
+                    logger.debug("Anthropic: tool buffering ended without valid parse, emitting %d chars as text", len(buffer))
+                    yield from emit_text(buffer)
             else:
-                logger.warning("Tool tag detected but parsing failed; emitting as text")
-                yield from emit_text(tool_buffer)
-        else:
-            yield from emit_text(buffer)
+                yield from emit_text(buffer)
 
         yield from close_text_block()
 

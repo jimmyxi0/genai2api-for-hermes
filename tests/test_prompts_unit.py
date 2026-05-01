@@ -67,9 +67,9 @@ def test_inject_tool_prompt_includes_claude_code_tool_examples():
 
     result = inject_tool_prompt([{"role": "user", "content": "search"}], tools)
 
-    assert '"name": "Grep"' in result[0]["content"]
-    assert '"pattern": "search text"' in result[0]["content"]
-    assert "NEVER use <arg_key>" in result[0]["content"]
+    assert '<invoke name="Grep">' in result[0]["content"]
+    assert '<parameter name="pattern">' in result[0]["content"]
+    assert "NEVER use bare tool names" in result[0]["content"]
 
 
 def test_format_tool_examples_omits_unknown_tools():

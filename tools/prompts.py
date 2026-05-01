@@ -10,19 +10,21 @@ You have access to the following tools:
 
 When you need to call a tool, you MUST use the following XML format. Do NOT use markdown code blocks.
 
-<tool_call>
-{{"name": "<function-name>", "arguments": {{<arguments-as-json>}}}}
-</tool_call>
+<tool_calls>
+<invoke name="FUNC_NAME">
+<parameter name="KEY">VALUE</parameter>
+</invoke>
+</tool_calls>
 
 {tool_examples}
 
 Rules:
-1. You can call multiple tools by using multiple <tool_call> blocks.
-2. If you don't need any tool, just respond normally in plain text without any <tool_call> tags.
+1. You can call multiple tools by using multiple <invoke> blocks inside <tool_calls>.
+2. If you don't need any tool, just respond normally in plain text without any <tool_calls> tags.
 3. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
-4. The "arguments" field MUST be a valid JSON object matching the tool's parameter schema.
-5. NEVER use <arg_key>, <arg_value>, dotted names like Grep.datasource, or a bare tool name.
-6. NEVER wrap <tool_call> in markdown code blocks like ```xml or ```json."""
+4. Parameter values MUST be valid JSON for object/array types, or plain text for string types.
+5. NEVER use bare tool names, dotted names like Grep.datasource, or JSON-only tool calls.
+6. NEVER wrap tool calls in markdown code blocks like ```xml or ```json."""
 
 TOOL_CHOICE_REQUIRED_PROMPT = "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
 TOOL_CHOICE_SPECIFIC_PROMPT = (
@@ -98,14 +100,16 @@ def format_tool_examples(tools):
         name = tool.get("function", {}).get("name")
         if name not in COMMON_TOOL_EXAMPLES:
             continue
-        call_obj = {
-            "name": name,
-            "arguments": COMMON_TOOL_EXAMPLES[name],
-        }
+        args = COMMON_TOOL_EXAMPLES[name]
+        params = []
+        for k, v in args.items():
+            params.append(f'<parameter name="{k}">{v}</parameter>')
         examples.append(
-            "<tool_call>\n"
-            f"{json.dumps(call_obj, ensure_ascii=False)}\n"
-            "</tool_call>"
+            "<tool_calls>\n"
+            f'<invoke name="{name}">\n'
+            + "\n".join(params) + "\n"
+            + "</invoke>\n"
+            + "</tool_calls>"
         )
 
     if not examples:
@@ -162,11 +166,21 @@ def inject_tool_prompt(messages, tools, tool_choice=None):
             tc_text = flatten_message_content(msg.get("content")) or ""
             for tc in msg["tool_calls"]:
                 func = tc.get("function", {})
-                call_obj = {
-                    "name": func.get("name", ""),
-                    "arguments": json.loads(func.get("arguments", "{}")),
-                }
-                tc_text += f"\n<tool_call>\n{json.dumps(call_obj, ensure_ascii=False)}\n</tool_call>"
+                name = func.get("name", "")
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                params = []
+                for k, v in args.items():
+                    params.append(f'<parameter name="{k}">{json.dumps(v) if isinstance(v, (dict, list)) else v}</parameter>')
+                tc_text += (
+                    "\n<tool_calls>\n"
+                    f'<invoke name="{name}">\n'
+                    + "\n".join(params) + "\n"
+                    + "</invoke>\n"
+                    + "</tool_calls>"
+                )
             new_messages.append({"role": "assistant", "content": tc_text.strip()})
 
         else:

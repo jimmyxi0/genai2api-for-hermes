@@ -46,8 +46,123 @@ TOOL_ARG_KEYS_BY_TOOL = {
 
 
 def strip_think_blocks(content):
-    return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
 
+
+def normalize_dsml_tags(text):
+    """Convert DSML tags to standard XML format."""
+    if not text:
+        return text
+    # Handle both fullwidth and regular pipe characters
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*tool_calls\s*>', '<tool_calls>', text, flags=re.IGNORECASE)
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*/tool_calls\s*>', '</tool_calls>', text, flags=re.IGNORECASE)
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*invoke\s+name="([^"]+)"\s*>', r'<invoke name="\1">', text, flags=re.IGNORECASE)
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*/invoke\s*>', '</invoke>', text, flags=re.IGNORECASE)
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*parameter\s+name="([^"]+)"\s*>', r'<parameter name="\1">', text, flags=re.IGNORECASE)
+    text = re.sub(r'<\s*[｜|]DSML[｜|]\s*/parameter\s*>', '</parameter>', text, flags=re.IGNORECASE)
+    return text
+
+
+def strip_fenced_code_blocks(text):
+    """Remove content inside markdown code fences."""
+    if not text or '```' not in text:
+        return text
+    lines = text.split('\n')
+    result = []
+    in_fence = False
+    fence_char = None
+    for line in lines:
+        if not in_fence:
+            if line.startswith('```') or line.startswith('~~~'):
+                in_fence = True
+                fence_char = line[:3]
+                continue
+            result.append(line)
+        else:
+            if line.startswith(fence_char):
+                in_fence = False
+                fence_char = None
+    return '\n'.join(result)
+
+
+def parse_invoke_style_calls(text, allowed_tool_names=None):
+    """Parse <invoke name="..."><parameter name="...">value</parameter> format."""
+    if not text or '<invoke' not in text:
+        return [], None
+    
+    # Find all <tool_calls> blocks
+    tool_calls = []
+    spans = []
+    
+    # Match <tool_calls>...</tool_calls> blocks
+    wrapper_pattern = re.compile(r'<tool_calls[^>]*>(.*?)</tool_calls>', re.DOTALL | re.IGNORECASE)
+    for wrapper_match in wrapper_pattern.finditer(text):
+        spans.append((wrapper_match.start(), wrapper_match.end()))
+    
+    if not spans:
+        # Try single invoke without wrapper
+        invoke_pattern = re.compile(r'<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>', re.DOTALL | re.IGNORECASE)
+        for match in invoke_pattern.finditer(text):
+            tool_name = match.group(1).strip()
+            body = match.group(2).strip()
+            if allowed_tool_names and tool_name not in allowed_tool_names:
+                continue
+            args = {}
+            # Parse parameters
+            param_pattern = re.compile(r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>', re.DOTALL | re.IGNORECASE)
+            for param_match in param_pattern.finditer(body):
+                key = param_match.group(1).strip()
+                value = param_match.group(2).strip()
+                args[key] = value
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+        return tool_calls, None
+    
+    # Process wrapper blocks
+    for start, end in spans:
+        block = text[start:end]
+        invoke_pattern = re.compile(r'<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>', re.DOTALL | re.IGNORECASE)
+        for match in invoke_pattern.finditer(block):
+            tool_name = match.group(1).strip()
+            body = match.group(2).strip()
+            if allowed_tool_names and tool_name not in allowed_tool_names:
+                continue
+            args = {}
+            param_pattern = re.compile(r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>', re.DOTALL | re.IGNORECASE)
+            for param_match in param_pattern.finditer(body):
+                key = param_match.group(1).strip()
+                value = param_match.group(2).strip()
+                args[key] = value
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+    
+    # Calculate remaining text
+    if spans:
+        remaining_parts = []
+        last_end = 0
+        for start, end in spans:
+            if start > last_end:
+                remaining_parts.append(text[last_end:start])
+            last_end = end
+        if last_end < len(text):
+            remaining_parts.append(text[last_end:])
+        remaining = ' '.join(remaining_parts).strip()
+    else:
+        remaining = None
+    
+    return tool_calls, remaining
 
 def _extract_json_object(raw):
     start = raw.find("{")
@@ -516,6 +631,8 @@ def _extract_function_style_calls(cleaned, allowed_tool_names):
             continue
 
         span_end = end_idx
+        if span_end is None:
+            continue
         while span_end < len(cleaned) and cleaned[span_end].isspace():
             span_end += 1
         if span_end < len(cleaned) and cleaned[span_end] == ")":
@@ -546,10 +663,31 @@ def _extract_function_style_calls(cleaned, allowed_tool_names):
     return tool_calls, _clean_remaining_text("".join(remaining_parts))
 
 
+def _run_fallback_extractors(cleaned, allowed_tool_names):
+    """Run all fallback extractors in order until one succeeds."""
+    for extractor in (
+        _extract_edit_tool_calls,
+        _extract_plain_text_tool_calls,
+        _extract_loose_xml_tool_calls,
+        _extract_mixed_format_calls,
+        _extract_numbered_tool_calls,
+        _extract_function_style_calls,
+        _extract_bare_json_tool_calls,
+        _extract_malformed_named_tool_calls,
+        _extract_fenced_argument_calls,
+    ):
+        tool_calls, remaining = extractor(cleaned, allowed_tool_names)
+        if tool_calls:
+            return tool_calls, remaining
+    return None, None
+
+
 def _extract_bare_json_tool_calls(cleaned, allowed_tool_names):
     tool_calls = []
     spans = []
     idx = 0
+    if not cleaned:
+        return [], None
     while idx < len(cleaned):
         start = cleaned.find("{", idx)
         if start == -1:
@@ -596,18 +734,125 @@ def _extract_bare_json_tool_calls(cleaned, allowed_tool_names):
     return tool_calls, _clean_remaining_text("".join(remaining_parts))
 
 
-def _run_fallback_extractors(cleaned, allowed_tool_names):
-    for extractor in (
-        _extract_numbered_tool_calls,
-        _extract_function_style_calls,
-        _extract_bare_json_tool_calls,
-        _extract_malformed_named_tool_calls,
-        _extract_fenced_argument_calls,
-    ):
-        tool_calls, remaining = extractor(cleaned, allowed_tool_names)
-        if tool_calls:
-            return tool_calls, remaining
-    return None, None
+def _extract_loose_xml_tool_calls(cleaned, allowed_tool_names):
+    """Aggressive XML-like tool call extraction for malformed LLM output."""
+    if not cleaned:
+        return [], None
+    
+    tool_calls = []
+    spans = []
+    
+    loose_pattern = re.compile(
+        r'<\s*(?:tool_call|invoke|tool_calls)\s+([^>]*?)>(.*?)</\s*(?:tool_call|invoke|tool_calls)\s*>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    for match in loose_pattern.finditer(cleaned):
+        attrs = match.group(1).strip()
+        body = match.group(2).strip()
+        
+        tool_name = _extract_tool_name_from_attrs(attrs)
+        if not tool_name:
+            name_match = re.search(r'(?:name|function)\s*[=:]\s*["\']?([A-Za-z_][A-Za-z0-9_.-]*)', attrs, re.IGNORECASE)
+            if name_match:
+                tool_name = _clean_tool_name(name_match.group(1))
+        
+        if not tool_name:
+            continue
+        
+        if allowed_tool_names and tool_name not in allowed_tool_names:
+            continue
+        
+        args = {}
+        
+        param_pattern = re.compile(
+            r'<\s*parameter\s+([^>]*?)\s*>(.*?)<\s*/\s*parameter\s*>',
+            re.DOTALL | re.IGNORECASE
+        )
+        for pmatch in param_pattern.finditer(body):
+            pattrs = pmatch.group(1).strip()
+            pvalue = pmatch.group(2).strip()
+            key_match = re.search(r'name\s*[=:]\s*["\']?([^"\'>\s]+)', pattrs, re.IGNORECASE)
+            if key_match:
+                args[key_match.group(1)] = pvalue
+        
+        if not args:
+            json_match = re.search(r'\{.*\}', body, re.DOTALL)
+            if json_match:
+                try:
+                    args = json.loads(json_match.group(0))
+                except:
+                    pass
+        
+        if args:
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+            spans.append((match.start(), match.end()))
+    
+    if not tool_calls:
+        return [], None
+    
+    remaining_parts = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start > cursor:
+            remaining_parts.append(cleaned[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(cleaned):
+        remaining_parts.append(cleaned[cursor:])
+    
+    return tool_calls, _clean_remaining_text("".join(remaining_parts))
+
+
+def _extract_mixed_format_calls(cleaned, allowed_tool_names):
+    """Handle mixed format: some XML, some plain text like 'Bash command=...'"""
+    if not cleaned:
+        return [], None
+    
+    tool_calls = []
+    remaining = cleaned
+    
+    mixed_pattern = re.compile(
+        r'^([A-Za-z_][A-Za-z0-9_.-]*)\s+((?:[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*[^\n]+(?:\n|$))+)',
+        re.MULTILINE
+    )
+    
+    for match in mixed_pattern.finditer(cleaned):
+        tool_name = _clean_tool_name(match.group(1))
+        if not tool_name:
+            continue
+        if allowed_tool_names and tool_name not in allowed_tool_names:
+            continue
+        
+        args_str = match.group(2)
+        args = {}
+        for kv_match in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[=:]\s*([^\n]+)', args_str):
+            key = kv_match.group(1).strip()
+            value = kv_match.group(2).strip().strip('"\'')
+            if key and value:
+                args[key] = value
+        
+        if args:
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+    
+    if not tool_calls:
+        return [], None
+    
+    remaining = mixed_pattern.sub('', cleaned).strip()
+    return tool_calls, _clean_remaining_text(remaining)
 
 
 def _extract_fenced_argument_calls(cleaned, allowed_tool_names):
@@ -640,6 +885,236 @@ def _extract_fenced_argument_calls(cleaned, allowed_tool_names):
 
     remaining = fence_pattern.sub('', cleaned).strip()
     return tool_calls, _clean_remaining_text(remaining)
+
+
+def _extract_plain_text_tool_calls(cleaned, allowed_tool_names):
+    """Extract tool calls from plain text like 'read filePath=/path' or 'Bash ls -la'."""
+    if not cleaned:
+        return [], None
+    
+    tool_name_map = {
+        'bash': 'Bash', 'shell': 'Bash', 'sh': 'Bash',
+        'read': 'Read', 'file': 'Read', 'cat': 'Read',
+        'glob': 'Glob', 'ls': 'Glob',
+        'grep': 'Grep', 'search': 'Grep',
+        'edit': 'Edit', 'modify': 'Edit',
+        'write': 'Write', 'save': 'Write',
+        'ls': 'LS', 'list': 'LS',
+        'towrite': 'TodoWrite', 'todo': 'TodoWrite',
+        'webfetch': 'WebFetch', 'fetch': 'WebFetch',
+        'websearch': 'WebSearch', 'search': 'WebSearch',
+    }
+    
+    tool_calls = []
+    spans = []
+    
+    patterns = [
+        re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)(?=\n|$|<tool|$)', re.MULTILINE | re.DOTALL),
+        re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*\s*=\s*"?[^"\s]+"?)', re.DOTALL),
+        re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*>\s*(.+?)$', re.MULTILINE),
+        re.compile(r'(?:^|\s|\.)(\.?[A-Za-z_][A-Za-z0-9_]*)\s*>\s*(.+?)(?=\n|$|<tool|$)', re.MULTILINE | re.DOTALL),
+    ]
+    
+    seen_positions = set()
+    
+    for pattern in patterns:
+        for match in pattern.finditer(cleaned):
+            if match.start() in seen_positions:
+                continue
+            seen_positions.add(match.start())
+            
+            raw_name = match.group(1).lower()
+            args_str = match.group(2).strip()
+            
+            tool_name = tool_name_map.get(raw_name)
+            if not tool_name:
+                continue
+            
+            args = {}
+            
+            if '=' in args_str:
+                for kv_match in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"?([^"\s]+)"?', args_str):
+                    key = kv_match.group(1).strip()
+                    value = kv_match.group(2).strip()
+                    if key and value:
+                        key_map = {
+                            'filePath': 'file_path', 'filepath': 'file_path',
+                            'file_path': 'file_path', 'path': 'file_path',
+                            'pattern': 'pattern', 'glob': 'pattern', 'regex': 'pattern',
+                            'command': 'command', 'cmd': 'command', 'cmdline': 'command',
+                            'outputMode': 'output_mode', 'outputmode': 'output_mode',
+                            'headLimit': 'head_limit', 'headlimit': 'head_limit',
+                            'offset': 'offset', 'limit': 'limit',
+                        }
+                        key = key_map.get(key, key)
+                        args[key] = value
+            else:
+                if tool_name == 'Bash':
+                    args = {"command": args_str.strip().strip('"')}
+                elif tool_name in ('Read', 'Glob', 'Grep'):
+                    first_arg = args_str.strip().strip('"')
+                    if first_arg.startswith('/'):
+                        args = {"file_path": first_arg.split()[0]}
+                    else:
+                        args = {"pattern": first_arg.split()[0]}
+            
+            if args:
+                if allowed_tool_names and tool_name not in allowed_tool_names and raw_name not in allowed_tool_names:
+                    continue
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                    }
+                })
+                spans.append((match.start(), match.end()))
+    
+    if not tool_calls:
+        return [], None
+    
+    remaining_parts = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start > cursor:
+            remaining_parts.append(cleaned[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(cleaned):
+        remaining_parts.append(cleaned[cursor:])
+    
+    return tool_calls, _clean_remaining_text("".join(remaining_parts))
+
+
+def _extract_edit_tool_calls(cleaned, allowed_tool_names):
+    """Specialized extractor for Edit and Write tool calls with multi-line support."""
+    if not cleaned:
+        return [], None
+    
+    tool_calls = []
+    spans = []
+    
+    # Normalize: remove backslash line continuations but preserve newlines
+    normalized = re.sub(r'\\\s*\n', '\n', cleaned)
+    
+    tool_pattern = re.compile(r'\b(edit|write)\s*>', re.IGNORECASE)
+    
+    matches = list(tool_pattern.finditer(normalized))
+    if not matches:
+        # Try alternative: find edit> or write> with backslash line continuation
+        tool_pattern2 = re.compile(r'\b(edit|write)\s*>\\\s*\n', re.IGNORECASE)
+        matches = list(tool_pattern2.finditer(cleaned))  # Use original cleaned to catch backslash
+        if not matches:
+            return [], None
+    
+    for idx, match in enumerate(matches):
+        raw_tool = match.group(1).lower()
+        tool_name = 'Edit' if raw_tool == 'edit' else 'Write'
+        if allowed_tool_names and tool_name not in allowed_tool_names:
+            continue
+        
+        # Extract content until next tool> or end
+        start = match.end()
+        if idx + 1 < len(matches):
+            end = matches[idx + 1].start()
+            full_args = normalized[start:end]
+        else:
+            full_args = normalized[start:]
+        
+        if not full_args.strip():
+            continue
+        
+        args = {}
+        
+        # Parse XML-style <parameter> tags (primary method)
+        param_pattern = re.compile(
+            r'<parameter\s+name\s*=\s*"([^"]+)"\s*>(.*?)</parameter>',
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        found_params = False
+        for param_match in param_pattern.finditer(full_args):
+            key = param_match.group(1).lower()
+            value = param_match.group(2).strip()
+            # Normalize key names
+            key_map = {
+                'filepath': 'file_path',
+                'file': 'file_path',
+                'path': 'file_path',
+                'oldstring': 'oldString',
+                'newstring': 'newString',
+            }
+            key = key_map.get(key, key)
+            args[key] = value
+            found_params = True
+        
+        # If no XML params found, try key=value format
+        if not found_params:
+            # Extract file_path/filePath
+            fp_match = re.search(r'filePath\s*=\s*"([^"]+)"', full_args, re.IGNORECASE)
+            if not fp_match:
+                fp_match = re.search(r'filePath\s*=\s*(\S+)', full_args, re.IGNORECASE)
+            if fp_match:
+                args['file_path'] = fp_match.group(1)
+            
+            # Extract content="..." - can be multi-line
+            content_start = re.search(r'content\s*=\s*"', full_args, re.IGNORECASE)
+            if content_start:
+                start_idx = content_start.end() - 1
+                search_start = start_idx + 1
+                while True:
+                    quote_idx = full_args.find('"', search_start)
+                    if quote_idx == -1:
+                        args['content'] = full_args[start_idx+1:]
+                        break
+                    if quote_idx > 0 and full_args[quote_idx-1] == '\\':
+                        search_start = quote_idx + 1
+                        continue
+                    args['content'] = full_args[start_idx+1:quote_idx]
+                    break
+            
+            # For Edit tool, extract oldString and newString
+            if tool_name == 'Edit':
+                for key in ['oldString', 'newString']:
+                    val_match = re.search(rf'{key}\s*=\s*"([^"]*)"', full_args, re.IGNORECASE)
+                    if val_match:
+                        args[key] = val_match.group(1)
+                    else:
+                        val_match = re.search(rf'{key}\s*=\s*(\S+)', full_args, re.IGNORECASE)
+                        if val_match:
+                            args[key] = val_match.group(1)
+        
+        # Validate
+        valid = False
+        if tool_name == 'Edit' and 'oldString' in args and 'newString' in args and 'file_path' in args:
+            valid = True
+        elif tool_name == 'Write' and 'file_path' in args and 'content' in args:
+            valid = True
+        
+        if valid:
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+            spans.append((match.start(), match.end()))
+    
+    if not tool_calls:
+        return [], None
+    
+    remaining_parts = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start > cursor:
+            remaining_parts.append(cleaned[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(cleaned):
+        remaining_parts.append(cleaned[cursor:])
+    
+    return tool_calls, _clean_remaining_text("".join(remaining_parts))
 
 
 def _extract_malformed_named_tool_calls(cleaned, allowed_tool_names):
@@ -701,7 +1176,23 @@ def _extract_numbered_tool_calls(cleaned, allowed_tool_names):
 
 def extract_tool_calls(content, allowed_tool_names=None):
     cleaned = strip_think_blocks(content)
-
+    
+    # Step 1: Normalize DSML tags
+    cleaned = normalize_dsml_tags(cleaned)
+    
+    # Step 2: Strip code fences (anti-leak) - but only when multiple tools allowed
+    # When only one tool is allowed, the fallback extractor handles fenced JSON
+    has_multiple_tools = allowed_tool_names and len(allowed_tool_names) > 1
+    if has_multiple_tools:
+        cleaned = strip_fenced_code_blocks(cleaned)
+    
+    # Step 3: Try invoke style first (new format)
+    invoke_calls, invoke_remaining = parse_invoke_style_calls(cleaned, allowed_tool_names)
+    if invoke_calls:
+        logger.debug("Found %d invoke-style tool calls", len(invoke_calls))
+        return invoke_calls, invoke_remaining
+    
+    # ... rest of existing code ...
     cleaned = re.sub(
         r'```(?:xml|json|plaintext|text)?\s*\n?\s*(<tool_call\b[^>]*>.*?</tool_call>)\s*\n?\s*```',
         r'\1',

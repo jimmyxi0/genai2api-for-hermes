@@ -1,36 +1,52 @@
-# GenAI2OpenAI
+# GenAI2API-for-Agents
 
-将上海科技大学 GenAI 平台接入 Claude Code 的代理服务。
+A proxy that connects ShanghaiTech GenAI platform to AI coding agents (Claude Code, Cursor, Continue, etc.) via OpenAI and Anthropic compatible APIs.
 
-A proxy that connects ShanghaiTech's GenAI platform to Claude Code.
+将上海科技大学 GenAI 平台接入 AI 编程代理（Claude Code、Cursor、Continue 等）的代理服务。
 
-## 快速开始
+## Quick Start
 
-### 1. 安装
+### 1. Install
 
 ```bash
 uv sync
 ```
 
-### 2. 启动代理
+### 2. Start the Proxy
+
+**Option A: One-command start (recommended)**
+
+1. Edit `.env` with your credentials:
+   - `GENAI_TOKEN` — student ID + password (e.g. `2025531042@mypassword`) or a JWT token
+   - `API_KEY` — optional API key for client auth
+   - `API_FORMAT` — `openai`, `anthropic`, or `both` (default: `both`)
+   - `PORT` — server port (default: `5000`)
+
+2. Run:
 
 ```bash
-# 学号密码模式（推荐，支持自动刷新）
-uv run main.py --token "学号@密码" --port 5000 --api-format both
+./start.sh
+```
 
-# JWT 模式（过期需手动更换）
+**Option B: Manual start**
+
+```bash
+# Student ID + password mode (recommended, supports auto-refresh)
+uv run main.py --token "student_id@password" --port 5000 --api-format both
+
+# JWT mode (requires manual token renewal)
 uv run main.py --token "eyJ..." --port 5000 --api-format both
 ```
 
-手动获取 JWT：前往 [GenAI 对话平台](https://genai.shanghaitech.edu.cn/)，F12 打开 Network，发送消息后从 `chat` 请求头中复制 `x-access-token`。
+To obtain a JWT manually: go to [GenAI](https://genai.shanghaitech.edu.cn/), open DevTools (F12), send a message, and copy the `x-access-token` from the `chat` request header.
 
-### 3. 配置 Claude Code
+### 3. Configure Claude Code
 
-设置环境变量（写入 `~/.bashrc` 或 `~/.zshrc`）：
+Set environment variables in `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:5000"
-export ANTHROPIC_AUTH_TOKEN="local-proxy"   # 如果设了 --api-key，改成同一个值
+export ANTHROPIC_AUTH_TOKEN="local-proxy"   # match --api-key if set
 export ANTHROPIC_MODEL="chatglm"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="MiniMax-M1"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-pro"
@@ -38,9 +54,9 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="chatglm"
 export ANTHROPIC_REASONING_MODEL="MiniMax-M1"
 ```
 
-### 4. 配置项目设置（减少权限弹窗）
+### 4. Configure Project Settings (reduce permission prompts)
 
-在项目根目录创建 `.claude/settings.json`：
+Create `.claude/settings.json` in your project root:
 
 ```json
 {
@@ -54,34 +70,34 @@ export ANTHROPIC_REASONING_MODEL="MiniMax-M1"
 }
 ```
 
-### 5. 启动
+### 5. Launch
 
 ```bash
 claude
 ```
 
-## 参数说明
+## Parameters
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--token` | JWT 令牌或 `学号@密码`（必需） | — |
-| `--port` | 服务监听端口 | `5000` |
-| `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无 |
-| `--api-format` | `openai`、`anthropic` 或 `both` | `both` |
-| `--debug` | 启用详细日志输出 | 关闭 |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--token` | JWT token or `student_id@password` (required) | — |
+| `--port` | Server listening port | `5000` |
+| `--api-key` | Client authentication key (or set `API_KEY` env var) | none |
+| `--api-format` | `openai`, `anthropic`, or `both` | `both` |
+| `--debug` | Enable verbose logging | off |
 
-## 特性
+## Features
 
-- **Claude Code 兼容** — 提供 Anthropic Messages API，支持 `tool_use/tool_result` 转换，可直接接入 Claude Code
-- **OpenAI 兼容** — 同时提供 OpenAI Chat Completion API，支持 Cursor、Continue 等客户端
-- **Tool Calling** — 通过 prompt 注入实现 function calling，兼容不原生支持的模型
-- **自动登录与刷新** — 学号密码模式通过 CAS 自动登录，JWT 过期静默刷新
-- **动态模型列表** — 自动从 GenAI 平台拉取可用模型
+- **Claude Code compatible** — Anthropic Messages API with `tool_use/tool_result` conversion
+- **OpenAI compatible** — Chat Completion API for Cursor, Continue, etc.
+- **Tool Calling** — Function calling via prompt injection for models without native support
+- **Auto-login & refresh** — CAS auto-login with student ID/password, silent JWT renewal
+- **Dynamic model list** — Automatically fetches available models from GenAI platform
 
-## 致谢
+## Acknowledgments
 
-本项目基于 [HeZeBang/GenAI2OpenAI](https://github.com/HeZeBang/GenAI2OpenAI) 开发，感谢原作者的工作。
+Based on [HeZeBang/GenAI2OpenAI](https://github.com/HeZeBang/GenAI2OpenAI). Thanks to the original author.
 
-## 许可
+## License
 
-MIT License — 详见 LICENSE 文件。
+MIT License — see LICENSE file.

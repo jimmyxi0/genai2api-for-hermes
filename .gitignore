@@ -216,3 +216,6 @@ images/
 
 # Claude Code
 .claude/
+
+# Local start script (contains credentials)
+start.sh
