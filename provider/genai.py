@@ -9,7 +9,7 @@ import requests
 
 from config import GENAI_URL, build_genai_headers, model_registry
 from errors import make_error_chunk
-from tools.parsing import extract_tool_calls, _tag_prefix_len
+from tools.parsing import extract_tool_calls
 from tools.prompts import flatten_message_content, normalize_message_content
 
 logger = logging.getLogger(__name__)
@@ -26,10 +26,52 @@ TOOL_MARKER_PATTERNS = [
 ]
 
 # How many chars to buffer before deciding "this is probably text, not tools"
-DETECTION_WINDOW = 512
+DETECTION_WINDOW = 128
 
 # Max chars to buffer when we've detected a tool call marker (safety cap)
 MAX_TOOL_BUFFER = 65536
+
+NATURAL_ENDING_RE = re.compile(
+    r'[.。!！?？\n:：;；\)）\]】』》""…\u2026]$'
+    r'|[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF]\s*$'
+)
+MIN_TRUNCATION_CHECK_LEN = 200
+MAX_EMPTY_RETRIES = 3
+CONTINUATION_PROMPT = (
+    "Your previous response was incomplete. Please continue exactly from where you left off."
+)
+TOOL_EMPTY_NUDGE = (
+    "You just made tool calls but did not provide a response. "
+    "Please provide your response now."
+)
+
+
+def _looks_like_natural_ending(text: str) -> bool:
+    if not text:
+        return True
+    if len(text) < MIN_TRUNCATION_CHECK_LEN:
+        return True
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    if NATURAL_ENDING_RE.search(stripped):
+        return True
+    return False
+
+
+def _detect_suspicious_stop(content: str, upstream_finish_reason: str) -> str:
+    if upstream_finish_reason != "stop":
+        return upstream_finish_reason
+    if not content:
+        return "stop"
+    if not _looks_like_natural_ending(content):
+        logger.warning(
+            "Treating suspicious stop response as truncated (len=%d, ending=%r)",
+            len(content),
+            content[-20:],
+        )
+        return "length"
+    return "stop"
 
 
 def convert_messages_to_genai_format(messages):
@@ -98,11 +140,36 @@ def _has_partial_tool_marker(text):
     tail = text[-32:] if len(text) > 32 else text
     lower_tail = tail.lower()
     for marker in TOOL_MARKER_PATTERNS:
-        # Check if the tail is a prefix of the marker, or the marker starts in the tail
         for i in range(len(marker)):
             if lower_tail.endswith(marker[:i + 1]) and i < len(marker) - 1:
                 return True
     return False
+
+
+def _split_safe_detection_text(text):
+    if not text:
+        return "", ""
+
+    marker_positions = [
+        pos for marker in TOOL_MARKER_PATTERNS
+        for pos in [text.lower().find(marker)]
+        if pos != -1
+    ]
+    if marker_positions:
+        split_at = min(marker_positions)
+        return text[:split_at], text[split_at:]
+
+    max_prefix = 0
+    lower = text.lower()
+    for marker in TOOL_MARKER_PATTERNS:
+        for length in range(1, min(len(marker), len(lower))):
+            if lower.endswith(marker[:length]):
+                max_prefix = max(max_prefix, length)
+
+    if max_prefix:
+        return text[:-max_prefix], text[-max_prefix:]
+
+    return text, ""
 
 
 def stream_genai_response(chat_info, messages, model, max_tokens, config):
@@ -170,11 +237,13 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
         finished = False
         emitted_done = False
         line_count = 0
+        upstream_finish_reason = "stop"
         for line in response.iter_lines():
             if finished:
                 break
 
             if line:
+                line_str = ""
                 try:
                     line_str = line.decode('utf-8') if isinstance(line, bytes) else line
 
@@ -197,15 +266,25 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
 
                         if "choices" in genai_json and len(genai_json["choices"]) > 0:
                             choice = genai_json["choices"][0]
-                            if choice.get("finish_reason") is not None:
+                            fr = choice.get("finish_reason")
+                            if fr is not None:
+                                upstream_finish_reason = fr
                                 finished = True
 
                         if finished:
+                            full_content = "".join(content_parts)
+                            effective_finish_reason = _detect_suspicious_stop(
+                                full_content, upstream_finish_reason
+                            )
+                            if effective_finish_reason == "length":
+                                logger.warning(
+                                    "Response truncated (finish_reason='length') - model hit max output tokens"
+                                )
                             log_stream_metrics(
                                 model,
                                 started_at,
                                 first_token_at,
-                                "".join(content_parts),
+                                full_content,
                                 "".join(reasoning_parts),
                             )
                             final_response = {
@@ -216,7 +295,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                                 "choices": [{
                                     "index": 0,
                                     "delta": {},
-                                    "finish_reason": "stop"
+                                    "finish_reason": effective_finish_reason
                                 }]
                             }
                             emitted_done = True
@@ -260,12 +339,26 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
         if emitted_done:
             return
 
+        full_content = "".join(content_parts)
+        full_reasoning = "".join(reasoning_parts)
+
+        if not content_parts and not reasoning_parts:
+            logger.warning("Empty response from model")
+
+        effective_finish_reason = _detect_suspicious_stop(
+            full_content, upstream_finish_reason
+        )
+        if effective_finish_reason == "length":
+            logger.warning(
+                "Response truncated (finish_reason='length') - model hit max output tokens"
+            )
+
         log_stream_metrics(
             model,
             started_at,
             first_token_at,
-            "".join(content_parts),
-            "".join(reasoning_parts),
+            full_content,
+            full_reasoning,
         )
         final_response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -275,7 +368,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
             "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop"
+                "finish_reason": effective_finish_reason
             }]
         }
         yield f"data: {json.dumps(final_response)}\n\n"
@@ -398,6 +491,7 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
     buffer = ""
     sent_role = False
     tool_detected = False
+    upstream_finish_reason = "stop"
 
     def _send_role():
         nonlocal sent_role
@@ -434,6 +528,9 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         content = chunk_delta.get("content", "")
         finish_reason = data["choices"][0].get("finish_reason")
 
+        if finish_reason:
+            upstream_finish_reason = finish_reason
+
         if not content:
             # Handle finish_reason from upstream (e.g., "stop")
             if finish_reason:
@@ -443,27 +540,33 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         if state == "detecting":
             buffer += content
 
-            # Check if we have a tool marker
             if _has_tool_marker(buffer):
                 tool_detected = True
                 state = "tool_buffering"
                 logger.debug("Tool marker detected in detection window, switching to tool_buffering (buf=%d chars)", len(buffer))
                 continue
 
-            # Check if buffer exceeds detection window and no marker yet
-            if len(buffer) >= DETECTION_WINDOW:
-                # No tool markers — this is probably plain text.
-                # Flush the buffer as text and switch to streaming mode.
+            flushable_text, pending_tail = _split_safe_detection_text(buffer)
+
+            if len(buffer) >= DETECTION_WINDOW and flushable_text:
                 state = "streaming"
                 logger.debug("No tool markers in %d chars, flushing as text, switching to streaming", len(buffer))
                 role_chunk = _send_role()
                 if role_chunk:
                     yield role_chunk
-                yield _emit_text_chunk(completion_id, created, model, buffer)
-                buffer = ""
+                yield _emit_text_chunk(completion_id, created, model, flushable_text)
+                buffer = pending_tail
                 continue
 
-            # Still within detection window, keep buffering
+            if len(flushable_text) >= DETECTION_WINDOW:
+                role_chunk = _send_role()
+                if role_chunk:
+                    yield role_chunk
+                yield _emit_text_chunk(completion_id, created, model, flushable_text)
+                buffer = pending_tail
+                state = "streaming"
+                continue
+
             continue
 
         elif state == "streaming":
@@ -533,7 +636,11 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
 
     # Stream ended — handle remaining buffer
     if not buffer:
+        effective_finish_reason = _detect_suspicious_stop("", upstream_finish_reason)
+        if effective_finish_reason == "length":
+            logger.warning("Response truncated (finish_reason='length') - model hit max output tokens")
         if not sent_role:
+            logger.warning("Model returned empty after tool calls — emitting empty response")
             role_chunk = _send_role()
             if role_chunk:
                 yield role_chunk
@@ -547,7 +654,7 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
             "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop"
+                "finish_reason": effective_finish_reason
             }]
         }
         yield f"data: {json.dumps(stop_chunk)}\n\n"
@@ -575,6 +682,12 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         yield role_chunk
     yield _emit_text_chunk(completion_id, created, model, buffer)
 
+    effective_finish_reason = _detect_suspicious_stop(buffer, upstream_finish_reason)
+    if effective_finish_reason == "length":
+        logger.warning(
+            "Response truncated (finish_reason='length') - model hit max output tokens"
+        )
+
     stop_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -583,7 +696,7 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         "choices": [{
             "index": 0,
             "delta": {},
-            "finish_reason": "stop"
+            "finish_reason": effective_finish_reason
         }]
     }
     yield f"data: {json.dumps(stop_chunk)}\n\n"

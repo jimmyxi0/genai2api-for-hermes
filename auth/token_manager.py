@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 
-from auth.cas_login import LoginError, login_genai
+from auth.cas_login import login_genai
 
 logger = logging.getLogger(__name__)
 

@@ -4,13 +4,13 @@ import ast
 import re
 import time
 import uuid
-from datetime import datetime
+# from datetime import datetime  # unused
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 
 from config import GENAI_URL, build_genai_headers, model_registry
-from tools.parsing import extract_tool_calls, _tag_prefix_len
+from tools.parsing import extract_tool_calls
 from tools.prompts import inject_tool_prompt
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,25 @@ DETECTION_WINDOW = 512
 
 # Max chars to buffer when we've detected a tool call marker (safety cap)
 MAX_TOOL_BUFFER = 65536
+
+NATURAL_ENDING_RE = re.compile(
+    r'[.。!！?？\n:：;；\)）\]】』》""…\u2026]$'
+    r'|[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF]\s*$'
+)
+MIN_TRUNCATION_CHECK_LEN = 200
+
+
+def _looks_like_natural_ending(text: str) -> bool:
+    if not text:
+        return True
+    if len(text) < MIN_TRUNCATION_CHECK_LEN:
+        return True
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    if NATURAL_ENDING_RE.search(stripped):
+        return True
+    return False
 
 
 def anthropic_content_to_text(content: Any) -> str:
@@ -654,6 +673,7 @@ def stream_genai_as_anthropic(
             return
 
         finished = False
+        upstream_finish_reason = "stop"
         for line in response.iter_lines():
             if finished:
                 break
@@ -679,7 +699,9 @@ def stream_genai_as_anthropic(
 
                         if "choices" in genai_json and len(genai_json["choices"]) > 0:
                             choice = genai_json["choices"][0]
-                            if choice.get("finish_reason") is not None:
+                            fr = choice.get("finish_reason")
+                            if fr is not None:
+                                upstream_finish_reason = fr
                                 finished = True
 
                         content, _reasoning = extract_content_from_genai(genai_json)
@@ -768,6 +790,19 @@ def stream_genai_as_anthropic(
 
         # Stream ended — handle remaining buffer
         stop_reason = "end_turn"
+        output_text = "".join(content_parts)
+
+        if upstream_finish_reason == "stop" and not _looks_like_natural_ending(output_text):
+            logger.warning(
+                "Anthropic: treating suspicious stop response as truncated (len=%d)",
+                len(output_text),
+            )
+            stop_reason = "max_tokens"
+        elif upstream_finish_reason == "length":
+            logger.warning(
+                "Anthropic: response truncated (upstream finish_reason='length')"
+            )
+            stop_reason = "max_tokens"
 
         if buffer:
             if state == "tool_buffering" or tool_detected:
@@ -785,7 +820,6 @@ def stream_genai_as_anthropic(
         yield from close_text_block()
 
         # Calculate output tokens
-        output_text = "".join(content_parts)
         output_tokens = max(1, len(output_text) // 4) if output_text else 0
 
         # Send message_delta with stop_reason

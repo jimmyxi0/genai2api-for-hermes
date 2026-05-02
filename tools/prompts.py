@@ -8,7 +8,7 @@ You have access to the following tools:
 {tool_definitions}
 </tools>
 
-When you need to call a tool, you MUST use the following XML format. Do NOT use markdown code blocks.
+CRITICAL: When you need to call a tool, you MUST use ONLY the following XML format. Do NOT use any other format.
 
 <tool_calls>
 <invoke name="FUNC_NAME">
@@ -18,13 +18,15 @@ When you need to call a tool, you MUST use the following XML format. Do NOT use 
 
 {tool_examples}
 
-Rules:
-1. You can call multiple tools by using multiple <invoke> blocks inside <tool_calls>.
-2. If you don't need any tool, just respond normally in plain text without any <tool_calls> tags.
-3. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
-4. Parameter values MUST be valid JSON for object/array types, or plain text for string types.
-5. NEVER use bare tool names, dotted names like Grep.datasource, or JSON-only tool calls.
-6. NEVER wrap tool calls in markdown code blocks like ```xml or ```json."""
+CRITICAL FORMAT RULES:
+1. You MUST use <tool_calls><invoke name="TOOL_NAME"><parameter name="KEY">VALUE</parameter></invoke></tool_calls>
+2. NEVER use bare tool names like: Bash command=ls
+3. NEVER use formats like: terminal〉command〉ls (fullwidth brackets)
+4. NEVER use JSON-only tool calls without XML wrapper
+5. NEVER wrap tool calls in markdown code blocks like ```xml or ```json
+6. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
+7. If you made tool calls and received results, you MUST respond with either more tool calls or a final answer."""
+
 
 TOOL_CHOICE_REQUIRED_PROMPT = "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
 TOOL_CHOICE_SPECIFIC_PROMPT = (
@@ -83,7 +85,7 @@ def format_tool_definitions(tools):
         params = func.get("parameters", {})
         params_json = json.dumps(params, ensure_ascii=False, indent=2)
         definitions.append(
-            f"<tool_definition>\n"
+            f"<tool_definition\n"
             f"  <name>{func['name']}</name>\n"
             f"  <description>{func.get('description', '')}</description>\n"
             f"  <parameters>\n{params_json}\n  </parameters>\n"

@@ -20,12 +20,9 @@ Test Scenarios:
 
 import argparse
 import json
-import sys
 import time
 import requests
-import re
 from datetime import datetime
-from typing import Optional
 
 # === Tool Definitions (Real Claude Code Tools) ===
 
@@ -216,7 +213,7 @@ class PressureTest:
                     content += delta["content"]
                 if delta.get("tool_calls"):
                     tool_calls.extend(delta["tool_calls"])
-            except:
+            except Exception:
                 pass
         return {"content": content, "tool_calls": tool_calls}
     
@@ -355,10 +352,10 @@ class PressureTest:
                 success = test_fn(model)
                 results.append(success)
                 if success:
-                    self.log(f"    ✓ PASS")
+                    self.log("    ✓ PASS")
                     break
                 else:
-                    self.log(f"    ✗ FAIL")
+                    self.log("    ✗ FAIL")
             except Exception as e:
                 self.log(f"    ✗ ERROR: {type(e).__name__}: {e}")
                 results.append(False)

@@ -1,9 +1,9 @@
-import logging
 
 from flask import Flask, g
 from flask_cors import CORS
 
-from config import Config, TokenExpiredError, LoginError
+from config import Config, TokenExpiredError
+from auth.cas_login import LoginError
 from auth.apikey import register_auth
 from api import register_routes
 from errors import openai_error

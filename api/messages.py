@@ -1,9 +1,9 @@
 import json
-import logging
 import time
 import uuid
 
 from flask import Blueprint, current_app, request, jsonify, stream_with_context, Response
+
 
 from provider.anthropic import (
     anthropic_allowed_tool_names,
@@ -12,6 +12,7 @@ from provider.anthropic import (
     stream_genai_as_anthropic,
 )
 
+import logging
 logger = logging.getLogger(__name__)
 
 messages_bp = Blueprint('messages', __name__)
@@ -161,10 +162,10 @@ def messages():
             }
             return jsonify(response)
 
-    except Exception as e:
+    except Exception:
         logger.exception("[%s] Unhandled error", request_id)
         return anthropic_error(
-            str(e),
+            "Unhandled exception occurred",
             error_type="api_error",
             status=500
         )
@@ -193,6 +194,6 @@ def count_tokens():
         return jsonify({
             "input_tokens": estimated_tokens,
         })
-    except Exception as e:
+    except Exception:
         logger.exception("Error counting tokens")
         return jsonify({"input_tokens": 1})

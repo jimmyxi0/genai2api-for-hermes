@@ -515,6 +515,71 @@ def _parse_argument_tag(raw, tool_name=None):
     return {"name": tool_name, "arguments": {key: argument}}
 
 
+    return None
+
+
+def _parse_fullwidth_bracket_format(raw, tool_name=None):
+    """Parse tool calls in the format: toolname〉key〉value (fullwidth brackets).
+    
+    Examples:
+      terminal〉command〉cd /path && git status
+      Read〉file_path〉/path/to/file
+      Bash〉command〉ls -la〉description〉List files
+    """
+    FULLWIDTH_RANGLE = chr(65381)  # U+FF65 〉
+    if FULLWIDTH_RANGLE not in raw:
+        return None
+    
+    parts = raw.split(FULLWIDTH_RANGLE)
+    if len(parts) < 3:
+        return None
+    
+    # Map common tool name variations to canonical names
+    tool_name_map = {
+        'terminal': 'Bash',
+        'shell': 'Bash', 
+        'cmd': 'Bash',
+        'exec': 'Bash',
+        'run': 'Bash',
+        'read': 'Read',
+        'cat': 'Read',
+        'file': 'Read',
+        'grep': 'Grep',
+        'search': 'Grep',
+        'glob': 'Glob',
+        'ls': 'Glob',
+        'write': 'Write',
+        'edit': 'Edit',
+    }
+    
+    name = tool_name
+    raw_name = parts[0].strip().lower()
+    if not name and raw_name:
+        name = tool_name_map.get(raw_name, raw_name.capitalize())
+    if not name:
+        return None
+    
+    arguments = {}
+    i = 1
+    while i < len(parts) - 1:
+        key = parts[i].strip()
+        if not key:
+            i += 1
+            continue
+        key = _clean_tool_name(key)
+        if not key:
+            i += 1
+            continue
+        value = parts[i + 1]
+        arguments[key] = value.strip()
+        i += 2
+    
+    if not arguments:
+        return None
+    
+    return {"name": name, "arguments": arguments}
+
+
 def _parse_tool_call_body(raw, tool_name=None):
     raw = raw.strip()
     normalized_raw = raw.replace('\\"', '"')
@@ -586,6 +651,10 @@ def _parse_tool_call_body(raw, tool_name=None):
             except (json.JSONDecodeError, ValueError):
                 arguments = {"raw": args_str}
         return {"name": name, "arguments": arguments}
+
+    fullwidth_call = _parse_fullwidth_bracket_format(raw, tool_name=tool_name)
+    if fullwidth_call:
+        return fullwidth_call
 
     return None
 
@@ -781,7 +850,7 @@ def _extract_loose_xml_tool_calls(cleaned, allowed_tool_names):
             if json_match:
                 try:
                     args = json.loads(json_match.group(0))
-                except:
+                except Exception:
                     pass
         
         if args:
@@ -899,10 +968,8 @@ def _extract_plain_text_tool_calls(cleaned, allowed_tool_names):
         'grep': 'Grep', 'search': 'Grep',
         'edit': 'Edit', 'modify': 'Edit',
         'write': 'Write', 'save': 'Write',
-        'ls': 'LS', 'list': 'LS',
         'towrite': 'TodoWrite', 'todo': 'TodoWrite',
         'webfetch': 'WebFetch', 'fetch': 'WebFetch',
-        'websearch': 'WebSearch', 'search': 'WebSearch',
     }
     
     tool_calls = []

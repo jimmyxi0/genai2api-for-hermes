@@ -300,7 +300,6 @@ def test_stream_tool_call():
         try:
             chunk = json.loads(data_str)
             delta = chunk.get("choices", [{}])[0].get("delta", {})
-            finish = chunk.get("choices", [{}])[0].get("finish_reason")
 
             if delta.get("content"):
                 full_content += delta["content"]
@@ -311,8 +310,8 @@ def test_stream_tool_call():
                     tool_calls_found.append(tc)
                     print(f"  tool_call: {tc['function']['name']}({tc['function']['arguments']})")
 
-            if finish:
-                print(f"  finish_reason: {finish}")
+            # finish variable removed during lint fix
+
 
         except json.JSONDecodeError:
             pass
@@ -321,10 +320,10 @@ def test_stream_tool_call():
         print(f"\n[PASS] Stream tool calls detected: {len(tool_calls_found)}")
         return True
     elif full_content and '<tool_call>' in full_content:
-        print(f"\n[WARN] Tool call in raw text but not parsed")
+        print("\n[WARN] Tool call in raw text but not parsed")
         return False
     else:
-        print(f"\n[FAIL] No tool calls in stream")
+        print("\n[FAIL] No tool calls in stream")
         print(f"  Content: {full_content[:200]}")
         return False
 
@@ -360,7 +359,6 @@ def test_stream_no_tool_needed():
         try:
             chunk = json.loads(data_str)
             delta = chunk.get("choices", [{}])[0].get("delta", {})
-            finish = chunk.get("choices", [{}])[0].get("finish_reason")
 
             if delta.get("content"):
                 if first_chunk_time is None:
@@ -383,10 +381,10 @@ def test_stream_no_tool_needed():
         print(f"\n[PASS] True streaming: {len(chunks)} chunks (not buffered into 1)")
         return True
     elif len(chunks) == 1 and full_content:
-        print(f"\n[WARN] Only 1 chunk — may be buffered")
+        print("\n[WARN] Only 1 chunk — may be buffered")
         return False
     else:
-        print(f"\n[FAIL] No content received")
+        print("\n[FAIL] No content received")
         return False
 
 
@@ -435,7 +433,7 @@ def test_tag_prefix_detection():
     if all_pass:
         print(f"\n[PASS] All {len(cases)} cases passed")
     else:
-        print(f"\n[FAIL] Some cases failed")
+        print("\n[FAIL] Some cases failed")
     return all_pass
 
 

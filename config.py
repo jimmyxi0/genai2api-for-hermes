@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from auth.cas_login import LoginError
+# from auth.cas_login import LoginError  # unused
 from auth.token_manager import TokenExpiredError, TokenManager
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,20 @@ class ModelRegistry:
     def get_models(self, token: str) -> dict[str, ModelInfo]:
         if not self._models or (time.time() - self._last_fetched > self._cache_ttl):
             self.fetch(token)
+        # If fetch failed and we have no models, provide a minimal fallback to keep
+        # the API responsive and allow proxy clients to continue operating.
+        if not self._models:
+            logger.warning("GenAI model registry empty; applying fallback model.")
+            self._models = {
+                "default-model": ModelInfo(
+                    id="default-model",
+                    name="Default GenAI Model",
+                    root_ai_type="default",
+                    max_tokens=None,
+                    description="Fallback model when upstream model list is unavailable",
+                )
+            }
+            self._last_fetched = time.time()
         return self._models
 
     def get_root_ai_type(self, model: str, token: str) -> str:

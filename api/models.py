@@ -19,3 +19,8 @@ def list_models():
             "permission": []
         })
     return jsonify({"object": "list", "data": models})
+
+# Backwards-compatibility alias: support legacy proxy path /api/v1/models
+@models_bp.route('/api/v1/models', methods=['GET'])
+def list_models_api():
+    return list_models()

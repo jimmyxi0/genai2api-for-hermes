@@ -2,6 +2,7 @@ from api.chat import chat_bp
 from api.models import models_bp
 from api.health import health_bp
 from api.messages import messages_bp
+from api.compat_endpoints import compat_bp
 
 
 def register_routes(app):
@@ -17,3 +18,5 @@ def register_routes(app):
 
     app.register_blueprint(models_bp)
     app.register_blueprint(health_bp)
+    # Compatibility endpoints for legacy proxies
+    app.register_blueprint(compat_bp)
