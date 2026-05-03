@@ -17,7 +17,7 @@ uv sync
 **Option A: One-command start (recommended)**
 
 1. Edit `.env` with your credentials:
-   - `GENAI_TOKEN` — student ID + password (e.g. `2025531042@mypassword`) or a JWT token
+   - `GENAI_TOKEN` — student ID + password (e.g. `your_student_id@your_password`) or a JWT token
    - `API_KEY` — optional API key for client auth
    - `API_FORMAT` — `openai`, `anthropic`, or `both` (default: `both`)
    - `PORT` — server port (default: `5000`)
