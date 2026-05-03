@@ -393,18 +393,20 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
     for line in stream_genai_response(chat_info, messages, model, max_tokens, config):
         if not line.startswith("data: "):
             continue
-        data_str = line[6:].strip()
-        if data_str == "[DONE]":
-            continue
         try:
+            data_str = line[6:].strip()
+            if data_str == '[DONE]':
+                break
             data = json.loads(data_str)
         except json.JSONDecodeError:
             continue
         if "choices" not in data or not data["choices"]:
+            logger.debug("Upstream chunk missing choices: %r", data)
             continue
         chunk_delta = data["choices"][0].get("delta", {})
         content = chunk_delta.get("content", "")
         if not content:
+            logger.debug("Upstream chunk has no content: %r", data)
             continue
 
         if tool_detected:

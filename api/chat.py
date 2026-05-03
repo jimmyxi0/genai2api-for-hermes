@@ -89,6 +89,14 @@ def _parse_chunks(chunks):
         except (json.JSONDecodeError, IndexError, KeyError):
             pass
 
+    # Diagnostic logging for empty responses
+    if not (has_content or has_reasoning or has_tool_calls):
+        logger.warning("_parse_chunks: no content detected - chunks=%d, has_content=%s, has_reasoning=%s, has_tool_calls=%s",
+                       len(chunks), has_content, has_reasoning, has_tool_calls)
+        # Log first chunk for debugging
+        if chunks:
+            logger.debug("First chunk sample: %s", chunks[0][:200] if len(chunks[0]) > 200 else chunks[0])
+
     return has_content or has_reasoning or has_tool_calls, finish_reason, "".join(content_parts)
 
 
