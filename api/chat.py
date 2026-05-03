@@ -31,7 +31,6 @@ MID_SENTENCE_ENDINGS = re.compile(
 
 
 def get_model_max_tokens(model: str, config) -> int | None:
-    """Get the actual max_tokens limit from model registry, or return a safe default."""
     try:
         token = config.token_manager.get_token()
         models_info = model_registry.get_models(token)
@@ -41,19 +40,18 @@ def get_model_max_tokens(model: str, config) -> int | None:
     except Exception as e:
         logger.warning("Failed to fetch model max_tokens: %s", e)
 
-    # Fallback safe limits based on model name
     model_lower = model.lower()
     if "deepseek" in model_lower:
         return 64000
     if "glm" in model_lower:
-        return 8192      # chatglm 常见输出上限
+        return 8192
     if "gpt-4" in model_lower:
         return 8192
     if "gpt-3.5" in model_lower:
         return 4096
     if "claude" in model_lower:
         return 8192
-    return 8192          # 保守默认值
+    return 8192
 
 
 def _parse_chunks(chunks):
@@ -89,13 +87,8 @@ def _parse_chunks(chunks):
         except (json.JSONDecodeError, IndexError, KeyError):
             pass
 
-    # Diagnostic logging for empty responses
-    if not (has_content or has_reasoning or has_tool_calls):
-        logger.warning("_parse_chunks: no content detected - chunks=%d, has_content=%s, has_reasoning=%s, has_tool_calls=%s",
-                       len(chunks), has_content, has_reasoning, has_tool_calls)
-        # Log first chunk for debugging
-        if chunks:
-            logger.debug("First chunk sample: %s", chunks[0][:200] if len(chunks[0]) > 200 else chunks[0])
+    if not (has_content or has_reasoning or has_tool_calls) and chunks:
+        logger.debug("_parse_chunks: no content, first chunk sample: %s", chunks[0][:200])
 
     return has_content or has_reasoning or has_tool_calls, finish_reason, "".join(content_parts)
 
@@ -153,7 +146,6 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
                     yield chunk
                 return
             continuation_msg = f"{CONTINUATION_PROMPT}\n\n[Partial response]:\n{all_content}"
-            # Removed trimming: just append directly
             current_messages.append({"role": "user", "content": continuation_msg})
             continue
 
@@ -164,9 +156,7 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
                     "Model returned no content after %d retries — attempting clean reset",
                     max_retries,
                 )
-                # Removed trimming: use current_messages as is
                 logger.warning("Attempting clean reset (without trimming)")
-                # Add a reset prompt
                 current_messages.append({"role": "user", "content": "Please respond to the tool results above with your analysis or next action."})
 
                 if has_tools:
@@ -216,7 +206,14 @@ def chat_completions():
         tools = req_data.get('tools', None)
         tool_choice = req_data.get('tool_choice', None)
 
-        # ---- 动态限制 max_tokens 以避免截断 ----
+        # Optional warning for very long conversations (no truncation)
+        if len(messages) > 50:
+            logger.warning(
+                "[%s] Conversation has %d messages. Very long contexts may hit token limits.",
+                request_id, len(messages)
+            )
+
+        # ---- dynamic max_tokens limit ----
         model_max_limit = get_model_max_tokens(model, config)
         if max_tokens is None:
             max_tokens = model_max_limit
@@ -227,9 +224,7 @@ def chat_completions():
                     max_tokens, model_max_limit, model
                 )
                 max_tokens = model_max_limit
-        # 确保至少 1 token
         max_tokens = max(1, max_tokens)
-        # ---------------------------------------
 
         has_tools = tools and len(tools) > 0
         allowed_tool_names = {
@@ -252,8 +247,6 @@ def chat_completions():
             "[%s] model=%s stream=%s tools=%s messages=%d max_tokens=%d tool_choice_mode=%s",
             request_id, model, stream, bool(has_tools), len(messages), max_tokens, tool_choice_mode
         )
-
-        # Removed proactive trimming (the if len(messages) > 20 block)
 
         if has_tools:
             messages = inject_tool_prompt(messages, tools, tool_choice)
@@ -311,7 +304,6 @@ def chat_completions():
                                 "Response truncated (finish_reason='length') - requesting continuation (%d/%d)",
                                 total_retries, MAX_EMPTY_RETRIES
                             )
-                            # Removed trimming: just append directly
                             current_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                             continue
                         else:
@@ -321,7 +313,6 @@ def chat_completions():
 
                 total_retries += 1
                 if total_retries > MAX_EMPTY_RETRIES:
-                    # Clean reset without trimming
                     logger.warning("Non-streaming: attempting clean reset (without trimming)")
                     current_messages.append({"role": "user", "content": "Please respond to the tool results above."})
                     reset_content = ""
