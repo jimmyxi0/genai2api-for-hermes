@@ -40,24 +40,26 @@ DETECTION_WINDOW = 512
 # Max chars to buffer when we've detected a tool call marker (safety cap)
 MAX_TOOL_BUFFER = 65536
 
+# Deprecated: This heuristic caused false positives on valid responses (code, JSON, lists)
+# Kept for backward compatibility but no longer used for truncation detection
 NATURAL_ENDING_RE = re.compile(
-    r'[.。!！?？\n:：;；\)）\]】』》""…\u2026]$'
+    r'[.。!！?？\n:：;；\)\）\]\】\』\》""…\u2026]$'
     r'|[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF]\s*$'
 )
 MIN_TRUNCATION_CHECK_LEN = 200
 
 
 def _looks_like_natural_ending(text: str) -> bool:
-    if not text:
-        return True
-    if len(text) < MIN_TRUNCATION_CHECK_LEN:
-        return True
-    stripped = text.rstrip()
-    if not stripped:
-        return True
-    if NATURAL_ENDING_RE.search(stripped):
-        return True
-    return False
+    """
+    DEPRECATED: This function is no longer used for truncation detection.
+    
+    The old heuristic caused false positives on valid responses that:
+    - Exceed 200 chars (code blocks, JSON, technical writing)
+    - Don't end with punctuation (lists, code, structured output)
+    
+    We now trust upstream finish_reason unless there's explicit evidence of truncation.
+    """
+    return True  # Always return True to prevent false positive truncation detection
 
 
 def anthropic_content_to_text(content: Any) -> str:
