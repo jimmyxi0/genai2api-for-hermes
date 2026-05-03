@@ -7,7 +7,7 @@ from datetime import datetime
 
 from flask import Blueprint, current_app, request, jsonify, stream_with_context, Response
 
-from errors import openai_error
+from errors import openai_error, make_error_chunk
 from tools.prompts import inject_tool_prompt
 from tools.parsing import extract_tool_calls
 from provider.genai import (
@@ -33,6 +33,7 @@ def _parse_chunks(chunks):
     """Parse SSE chunks and return (has_any_content, finish_reason, all_content)."""
     has_content = False
     has_reasoning = False
+    has_tool_calls = False
     finish_reason = "stop"
     content_parts = []
 
@@ -48,18 +49,21 @@ def _parse_chunks(chunks):
                 delta = data['choices'][0].get('delta', {})
                 content = delta.get('content', '')
                 reasoning = delta.get('reasoning_content', '')
+                tool_calls = delta.get('tool_calls')
                 if content:
                     has_content = True
                     content_parts.append(content)
                 if reasoning:
                     has_reasoning = True
+                if tool_calls:
+                    has_tool_calls = True
                 fr = data['choices'][0].get('finish_reason')
                 if fr:
                     finish_reason = fr
         except (json.JSONDecodeError, IndexError, KeyError):
             pass
 
-    return has_content or has_reasoning, finish_reason, "".join(content_parts)
+    return has_content or has_reasoning or has_tool_calls, finish_reason, "".join(content_parts)
 
 
 def _looks_like_mid_sentence(text):
@@ -121,22 +125,41 @@ def _count_nudge_messages(messages):
     return count
 
 
+def _trim_conversation(messages, keep_last_n=6):
+    """Trim conversation to essentials: system message + last N messages."""
+    system_msgs = [msg for msg in messages if msg.get('role') == 'system']
+    other_msgs = [msg for msg in messages if msg.get('role') != 'system']
+
+    # Remove nudge/continuation messages
+    filtered = [
+        msg for msg in other_msgs
+        if msg.get('content') not in (TOOL_EMPTY_NUDGE, CONTINUATION_PROMPT)
+    ]
+
+    # Keep last N messages
+    if len(filtered) > keep_last_n:
+        filtered = filtered[-keep_last_n:]
+
+    return system_msgs + filtered
+
+
 def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools, allowed_tool_names, max_retries):
     """Buffer streaming response, retry with nudge if empty or truncated.
 
     Handles two failure modes:
-    1. Empty response → retry with continuation nudge (separate counter)
-    2. Truncated response (finish_reason='length') → auto-continue (separate counter)
+    1. Empty response → retry with continuation nudge
+    2. Truncated response (finish_reason='length') → auto-continue
 
-    If stuck in a loop (too many nudges without progress), tries a clean reset.
+    Uses a combined retry counter to prevent infinite loops.
+    Trims conversation history on retries to prevent context overflow.
     """
-    empty_retries = 0
-    continue_retries = 0
+    total_retries = 0
+    chunks = []  # Initialize to avoid unbound variable warning
     current_messages = list(messages)
+    # Only inject nudge on first attempt if needed
     current_messages = _proactively_inject_nudge(current_messages, has_tools)
-    original_messages = list(current_messages)
 
-    while True:
+    while total_retries <= max_retries:
         if has_tools:
             gen = stream_genai_response_with_tools(
                 chat_info, current_messages, model, max_tokens, config, allowed_tool_names
@@ -155,59 +178,77 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
             return
 
         if has_content and finish_reason == "length":
-            continue_retries += 1
+            total_retries += 1
             logger.warning(
                 "Streaming response truncated (finish_reason='length') — auto-continuing (%d/%d)",
-                continue_retries, max_retries
+                total_retries, max_retries
             )
-            if continue_retries > max_retries:
+            if total_retries > max_retries:
                 logger.warning("Max continuation retries reached, returning partial")
                 for chunk in chunks:
                     yield chunk
                 return
-            current_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+            continuation_msg = f"{CONTINUATION_PROMPT}\n\n[Partial response]:\n{all_content}"
+            current_messages = _trim_conversation(current_messages, keep_last_n=8)
+            current_messages.append({"role": "user", "content": continuation_msg})
             continue
 
         if not has_content:
-            empty_retries += 1
-            if empty_retries > max_retries:
+            total_retries += 1
+            if total_retries > max_retries:
                 logger.error(
-                    "Model returned no content after %d empty retries — attempting clean reset",
+                    "Model returned no content after %d retries — attempting clean reset",
                     max_retries,
                 )
-                # Fix 5: Try clean reset — remove all nudge messages
-                if _count_nudge_messages(current_messages) > 0:
-                    logger.warning("Attempting clean reset: removing nudge history")
-                    current_messages = [
-                        msg for msg in current_messages
-                        if msg.get('content') not in (TOOL_EMPTY_NUDGE, CONTINUATION_PROMPT)
-                    ]
-                    current_messages.append({"role": "user", "content": "Please respond to the tool results above with your analysis or next action."})
-                    # One final attempt with clean history
-                    if has_tools:
-                        gen = stream_genai_response_with_tools(
-                            chat_info, current_messages, model, max_tokens, config, allowed_tool_names
-                        )
-                    else:
-                        gen = stream_genai_response(
-                            chat_info, current_messages, model, max_tokens, config
-                        )
-                    reset_chunks = list(gen)
-                    reset_has, reset_fr, _ = _parse_chunks(reset_chunks)
-                    if reset_has:
-                        for chunk in reset_chunks:
-                            yield chunk
-                        return
+                # Try clean reset — remove all nudge messages and trim
+                clean_messages = _trim_conversation(current_messages, keep_last_n=4)
+                if clean_messages == current_messages:
+                    # Already clean, give up
+                    logger.error("All retries failed. Returning empty response.")
+                    yield make_error_chunk("Model returned empty response after retries", model)
+                    return
 
-                logger.error("All retries and reset failed. Returning what we have.")
-                for chunk in chunks:
-                    yield chunk
+                logger.warning("Attempting clean reset with trimmed history")
+                current_messages = clean_messages
+                current_messages.append({"role": "user", "content": "Please respond to the tool results above with your analysis or next action."})
+
+                # One final attempt with clean history
+                if has_tools:
+                    gen = stream_genai_response_with_tools(
+                        chat_info, current_messages, model, max_tokens, config, allowed_tool_names
+                    )
+                else:
+                    gen = stream_genai_response(
+                        chat_info, current_messages, model, max_tokens, config
+                    )
+                reset_chunks = list(gen)
+                reset_has, reset_fr, _ = _parse_chunks(reset_chunks)
+                if reset_has:
+                    for chunk in reset_chunks:
+                        yield chunk
+                    return
+
+                logger.error("Clean reset failed. Returning empty response.")
+                yield make_error_chunk("Model returned empty response", model)
                 return
 
-            logger.warning("Empty streaming response — retrying (%d/%d)", empty_retries, max_retries)
-            nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
-            current_messages.append({"role": "user", "content": nudge})
+            logger.warning("Empty streaming response — retrying (%d/%d)", total_retries, max_retries)
+            # Trim conversation on retry to prevent infinite growth
+            if total_retries == 1:
+                # First retry: just add nudge
+                nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
+                current_messages.append({"role": "user", "content": nudge})
+            else:
+                # Subsequent retries: trim and add nudge
+                current_messages = _trim_conversation(current_messages, keep_last_n=6)
+                nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
+                current_messages.append({"role": "user", "content": nudge})
             continue
+
+    # Should not reach here, but just in case
+    logger.error("Exited retry loop unexpectedly. Returning what we have.")
+    for chunk in chunks:
+        yield chunk
 
 
 @chat_bp.route('/v1/chat/completions', methods=['POST'])
@@ -239,6 +280,14 @@ def chat_completions():
         logger.info("[%s] model=%s stream=%s tools=%s messages=%d",
                      request_id, model, stream, bool(has_tools), len(messages))
 
+        # Proactive context management: trim if conversation is too long
+        if len(messages) > 20:
+            logger.warning(
+                "[%s] Long conversation detected (%d messages) - trimming proactively",
+                request_id, len(messages)
+            )
+            messages = _trim_conversation(messages, keep_last_n=18)
+
         if has_tools:
             messages = inject_tool_prompt(messages, tools, tool_choice)
 
@@ -264,13 +313,11 @@ def chat_completions():
         else:
             complete_content = ""
             finish_reason = "stop"
-            empty_retries = 0
-            continue_retries = 0
+            total_retries = 0
             current_messages = list(messages)
             current_messages = _proactively_inject_nudge(current_messages, has_tools)
-            original_messages = list(current_messages)
 
-            while True:
+            while total_retries <= MAX_EMPTY_RETRIES:
                 partial_content = ""
                 partial_finish = "stop"
                 for line in stream_genai_response(chat_info, current_messages, model, max_tokens, config):
@@ -294,12 +341,14 @@ def chat_completions():
                 if partial_content.strip():
                     complete_content += partial_content
                     if partial_finish == "length":
-                        continue_retries += 1
-                        if continue_retries <= MAX_EMPTY_RETRIES:
+                        total_retries += 1
+                        if total_retries <= MAX_EMPTY_RETRIES:
                             logger.warning(
                                 "Response truncated (finish_reason='length') - requesting continuation (%d/%d)",
-                                continue_retries, MAX_EMPTY_RETRIES
+                                total_retries, MAX_EMPTY_RETRIES
                             )
+                            # Trim conversation and add continuation prompt
+                            current_messages = _trim_conversation(current_messages, keep_last_n=8)
                             current_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                             continue
                         else:
@@ -309,40 +358,48 @@ def chat_completions():
                     finish_reason = partial_finish
                     break
 
-                empty_retries += 1
-                if empty_retries > MAX_EMPTY_RETRIES:
-                    # Fix 5: Try clean reset
-                    if _count_nudge_messages(current_messages) > 0:
-                        logger.warning("Non-streaming: attempting clean reset after empty retries")
-                        current_messages = [
-                            msg for msg in current_messages
-                            if msg.get('content') not in (TOOL_EMPTY_NUDGE, CONTINUATION_PROMPT)
-                        ]
-                        current_messages.append({"role": "user", "content": "Please respond to the tool results above."})
-                        # One final attempt
-                        reset_content = ""
-                        reset_finish = "stop"
-                        for line in stream_genai_response(chat_info, current_messages, model, max_tokens, config):
-                            if line.startswith('data: '):
-                                data_str = line[6:].strip()
-                                if data_str == '[DONE]':
-                                    continue
-                                try:
-                                    data = json.loads(data_str)
-                                    if 'choices' in data and data['choices']:
-                                        delta = data['choices'][0].get('delta', {})
-                                        content = delta.get('content', '')
-                                        if content:
-                                            reset_content += content
-                                        fr = data['choices'][0].get('finish_reason')
-                                        if fr:
-                                            reset_finish = fr
-                                except json.JSONDecodeError:
-                                    pass
-                        if reset_content.strip():
-                            complete_content += reset_content
-                            finish_reason = reset_finish
-                            break
+                total_retries += 1
+                if total_retries > MAX_EMPTY_RETRIES:
+                    # Try clean reset with trimmed history
+                    clean_messages = _trim_conversation(current_messages, keep_last_n=4)
+                    if clean_messages == current_messages:
+                        # Already clean, give up
+                        logger.error(
+                            "Model returned no content after all retries. No fallback providers configured."
+                        )
+                        return openai_error(
+                            "Model returned empty response after multiple retries",
+                            code="empty_response",
+                            status=502,
+                        )
+
+                    logger.warning("Non-streaming: attempting clean reset with trimmed history")
+                    current_messages = clean_messages
+                    current_messages.append({"role": "user", "content": "Please respond to the tool results above."})
+                    # One final attempt
+                    reset_content = ""
+                    reset_finish = "stop"
+                    for line in stream_genai_response(chat_info, current_messages, model, max_tokens, config):
+                        if line.startswith('data: '):
+                            data_str = line[6:].strip()
+                            if data_str == '[DONE]':
+                                continue
+                            try:
+                                data = json.loads(data_str)
+                                if 'choices' in data and data['choices']:
+                                    delta = data['choices'][0].get('delta', {})
+                                    content = delta.get('content', '')
+                                    if content:
+                                        reset_content += content
+                                    fr = data['choices'][0].get('finish_reason')
+                                    if fr:
+                                        reset_finish = fr
+                            except json.JSONDecodeError:
+                                pass
+                    if reset_content.strip():
+                        complete_content += reset_content
+                        finish_reason = reset_finish
+                        break
 
                     logger.error(
                         "Model returned no content after all retries. No fallback providers configured."
@@ -353,7 +410,10 @@ def chat_completions():
                         status=502,
                     )
 
-                logger.warning("Empty response from model — retrying (%d/%d)", empty_retries, MAX_EMPTY_RETRIES)
+                logger.warning("Empty response from model — retrying (%d/%d)", total_retries, MAX_EMPTY_RETRIES)
+                # Trim conversation on retry to prevent infinite growth
+                if total_retries > 1:
+                    current_messages = _trim_conversation(current_messages, keep_last_n=6)
                 nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
                 current_messages.append({"role": "user", "content": nudge})
 

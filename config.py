@@ -36,7 +36,35 @@ class ModelInfo:
 class ModelRegistry:
     _models: dict[str, ModelInfo] = field(default_factory=dict)
     _last_fetched: float = 0
-    _cache_ttl: float = 300  # 5 minutes
+    _cache_ttl: float = 900  # 15 minutes
+
+    # Static fallback model info (used when registry fetch fails)
+    _STATIC_FALLBACKS: dict[str, dict] = field(
+        default_factory=lambda: {
+            "chatglm": {"max_tokens": 128000, "root_ai_type": "xinference"},
+            "gpt-4": {"max_tokens": 128000, "root_ai_type": "xinference"},
+            "gpt-3.5": {"max_tokens": 16385, "root_ai_type": "xinference"},
+            "claude": {"max_tokens": 200000, "root_ai_type": "xinference"},
+            "deepseek": {"max_tokens": 64000, "root_ai_type": "xinference"},
+            "MiniMax": {"max_tokens": 245000, "root_ai_type": "xinference"},
+        }
+    )
+
+    def _apply_static_fallbacks(self) -> None:
+        """Apply static fallback model info when registry fetch fails."""
+        logger.warning("Applying static fallback model info")
+        models: dict[str, ModelInfo] = {}
+        for model_name, info in self._STATIC_FALLBACKS.items():
+            models[model_name] = ModelInfo(
+                id=model_name,
+                name=model_name,
+                root_ai_type=info["root_ai_type"],
+                max_tokens=info["max_tokens"],
+                description=f"Fallback model info for {model_name}",
+            )
+        self._models = models
+        self._last_fetched = time.time()
+        logger.info("Applied %d static fallback models", len(models))
 
     def fetch(self, token: str) -> None:
         headers = build_genai_headers(token)
@@ -46,16 +74,31 @@ class ModelRegistry:
             "pageSize": 999,
             "showStatusList": "2,3",
         }
-        try:
-            resp = requests.get(GENAI_MODELS_URL, headers=headers, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            logger.exception("Failed to fetch model list from GenAI")
-            return
+        # Retry up to 3 times with exponential backoff
+        data = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(GENAI_MODELS_URL, headers=headers, params=params, timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < 2:  # Not the last attempt
+                    wait_time = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        "Fetch attempt %d failed: %s. Retrying in %ds...",
+                        attempt + 1, e, wait_time
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.exception("Failed to fetch model list from GenAI after 3 retries")
+                    # Apply static fallbacks on final failure
+                    self._apply_static_fallbacks()
+                    return
 
-        if not data.get("success"):
-            msg = data.get("message", "Unknown error")
+        # If we get here, the request succeeded
+        if not data or not data.get("success"):
+            msg = data.get("message", "Unknown error") if data else "No data fetched"
             logger.warning("GenAI model list API returned failure: %s", msg)
             raise TokenExpiredError(msg)
 
@@ -80,20 +123,10 @@ class ModelRegistry:
     def get_models(self, token: str) -> dict[str, ModelInfo]:
         if not self._models or (time.time() - self._last_fetched > self._cache_ttl):
             self.fetch(token)
-        # If fetch failed and we have no models, provide a minimal fallback to keep
-        # the API responsive and allow proxy clients to continue operating.
+        # If fetch failed and we have no models, apply static fallbacks
         if not self._models:
-            logger.warning("GenAI model registry empty; applying fallback model.")
-            self._models = {
-                "default-model": ModelInfo(
-                    id="default-model",
-                    name="Default GenAI Model",
-                    root_ai_type="default",
-                    max_tokens=None,
-                    description="Fallback model when upstream model list is unavailable",
-                )
-            }
-            self._last_fetched = time.time()
+            logger.warning("GenAI model registry empty; applying static fallback models.")
+            self._apply_static_fallbacks()
         return self._models
 
     def get_root_ai_type(self, model: str, token: str) -> str:

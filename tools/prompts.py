@@ -152,6 +152,12 @@ def inject_tool_prompt(messages, tools, tool_choice=None):
         elif role == "tool":
             tool_call_id = msg.get("tool_call_id", "unknown")
             tool_content = flatten_message_content(msg.get("content", ""))
+
+            # Truncate tool results aggressively to prevent context overflow (max 1000 chars)
+            MAX_TOOL_RESULT_LEN = 1000
+            if len(tool_content) > MAX_TOOL_RESULT_LEN:
+                tool_content = tool_content[:MAX_TOOL_RESULT_LEN] + f"\n... [truncated, {len(tool_content)} chars total]"
+
             new_messages.append(
                 {
                     "role": "user",

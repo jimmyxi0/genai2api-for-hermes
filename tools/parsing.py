@@ -519,25 +519,46 @@ def _parse_argument_tag(raw, tool_name=None):
 
 
 def _parse_fullwidth_bracket_format(raw, tool_name=None):
-    """Parse tool calls in the format: toolname〉key〉value (fullwidth brackets).
-    
+    """Parse tool calls in the format: toolname〉key〉value〉/toolname〉 (fullwidth brackets).
+
     Examples:
-      terminal〉command〉cd /path && git status
-      Read〉file_path〉/path/to/file
-      Bash〉command〉ls -la〉description〉List files
+       terminal〉command〉cd /path〉timeout〉10〉/terminal〉
+       Read〉file_path〉/path/to/file〉/Read〉
+       Bash〉command〉ls -la〉description〉List files〉/Bash〉
     """
-    FULLWIDTH_RANGLE = chr(65381)  # U+FF65 〉
-    if FULLWIDTH_RANGLE not in raw:
-        return None
-    
-    parts = raw.split(FULLWIDTH_RANGLE)
-    if len(parts) < 3:
-        return None
-    
+    RIGHT_CORNER = '〉'  # U+3009 RIGHT CORNER BRACKET
+    if RIGHT_CORNER not in raw:
+        return None, None
+
+    # Search for tool call pattern: find a word followed by 〉
+    # The tool name is right before the first 〉
+    # But there might be text before, so we need to find where the tool call starts
+
+    # Strategy: find the first occurrence of 〉 and work backwards to find the tool name
+    # Tool name is a single word (alphanumeric + underscore) right before the first 〉
+
+    # Find all 〉 positions
+    parts_by_bracket = raw.split(RIGHT_CORNER)
+
+    # The tool name should be in parts_by_bracket[0] (before first 〉)
+    # But if there's text before, parts_by_bracket[0] might be "Some text terminal"
+    # We need to extract just the tool name from parts_by_bracket[0]
+
+    first_part = parts_by_bracket[0].strip() if parts_by_bracket else ""
+    if not first_part:
+        return None, None
+
+    # Extract the last word as the tool name (in case there's text before)
+    words = first_part.split()
+    raw_name = words[-1] if words else first_part
+
+    if not raw_name:
+        return None, None
+
     # Map common tool name variations to canonical names
     tool_name_map = {
         'terminal': 'Bash',
-        'shell': 'Bash', 
+        'shell': 'Bash',
         'cmd': 'Bash',
         'exec': 'Bash',
         'run': 'Bash',
@@ -550,19 +571,33 @@ def _parse_fullwidth_bracket_format(raw, tool_name=None):
         'ls': 'Glob',
         'write': 'Write',
         'edit': 'Edit',
+        'bash': 'Bash',
     }
-    
-    name = tool_name
-    raw_name = parts[0].strip().lower()
-    if not name and raw_name:
-        name = tool_name_map.get(raw_name, raw_name.capitalize())
-    if not name:
-        return None
-    
+
+    name = tool_name or tool_name_map.get(raw_name.lower(), raw_name.capitalize())
+
+    # Find closing tag 〉/name〉
+    closing_tag = f"{RIGHT_CORNER}/{raw_name}{RIGHT_CORNER}"
+    closing_pos = raw.find(closing_tag)
+    if closing_pos < 0:
+        # Try with capitalized name
+        closing_tag = f"{RIGHT_CORNER}/{name}{RIGHT_CORNER}"
+        closing_pos = raw.find(closing_tag)
+
+    # Extract body: everything between first 〉 and closing tag
+    first_sep = raw.find(RIGHT_CORNER)
+    if closing_pos > first_sep + 1:
+        body = raw[first_sep + 1:closing_pos]
+    else:
+        body = raw[first_sep + 1:]
+
+    # Parse alternating key-value pairs
+    # Format: key〉value〉key〉value...
+    body_parts = body.split(RIGHT_CORNER)
     arguments = {}
-    i = 1
-    while i < len(parts) - 1:
-        key = parts[i].strip()
+    i = 0
+    while i < len(body_parts) - 1:
+        key = body_parts[i].strip()
         if not key:
             i += 1
             continue
@@ -570,14 +605,23 @@ def _parse_fullwidth_bracket_format(raw, tool_name=None):
         if not key:
             i += 1
             continue
-        value = parts[i + 1]
-        arguments[key] = value.strip()
+        value = body_parts[i + 1].strip() if i + 1 < len(body_parts) else ""
+        arguments[key] = value
         i += 2
-    
+
     if not arguments:
-        return None
-    
-    return {"name": name, "arguments": arguments}
+        return None, None
+
+    # Return in the same format as other extractors
+    tool_call = {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        }
+    }
+    return [tool_call], None  # No remaining text handling for this format
 
 
 def _parse_tool_call_body(raw, tool_name=None):
@@ -678,6 +722,66 @@ def _clean_remaining_text(text):
     return cleaned or None
 
 
+def parse_truncated_tool_call(raw, allowed_tool_names=None):
+    """Try to extract tool call even if it's truncated/incomplete.
+    
+    Handles cases where the model's output was cut off mid-tool-call.
+    Returns (tool_calls_list, remaining_text) or (None, None).
+    """
+    if not raw or ('<invoke' not in raw and '<tool_call' not in raw):
+        return None, None
+    
+    # Try to find a complete tool name
+    name_match = re.search(r'<invoke\s+name="([^"]+)"', raw, re.IGNORECASE)
+    if not name_match:
+        # Try <tool_call> format
+        name_match = re.search(r'<tool_call\s+name="([^"]+)"', raw, re.IGNORECASE)
+    if not name_match:
+        return None, None
+    
+    tool_name = _clean_tool_name(name_match.group(1))
+    if not tool_name:
+        return None, None
+    
+    # Check if this tool name is allowed
+    if allowed_tool_names and tool_name not in allowed_tool_names:
+        return None, None
+    
+    # Try to extract whatever parameters we can find
+    arguments = {}
+    
+    # Look for <parameter name="...">value</parameter> patterns
+    param_pattern = re.compile(r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>', re.DOTALL | re.IGNORECASE)
+    for pmatch in param_pattern.finditer(raw):
+        key = _clean_tool_name(pmatch.group(1))
+        value = pmatch.group(2).strip()
+        if key:
+            arguments[key] = value
+    
+    # Also try name="..." value format (for fullwidth bracket style)
+    # Look for patterns like name="command" value="..."
+    if not arguments:
+        # Try to find key-value pairs after the tool name
+        # For truncated content, just capture what we can
+        pass
+    
+    # If we couldn't extract any arguments, this isn't a valid partial tool call
+    if not arguments:
+        return None, None
+    
+    # Create a tool call with a warning
+    tool_call = {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        }
+    }
+    
+    return [tool_call], "[WARNING: Tool call was truncated - content may be incomplete]"
+
+
 def _extract_function_style_calls(cleaned, allowed_tool_names):
     call_pattern = re.compile(r'([A-Za-z_][A-Za-z0-9_.-]*)\(\s*{')
     matches = list(call_pattern.finditer(cleaned))
@@ -735,6 +839,7 @@ def _extract_function_style_calls(cleaned, allowed_tool_names):
 def _run_fallback_extractors(cleaned, allowed_tool_names):
     """Run all fallback extractors in order until one succeeds."""
     for extractor in (
+        _parse_fullwidth_bracket_format,
         _extract_edit_tool_calls,
         _extract_plain_text_tool_calls,
         _extract_loose_xml_tool_calls,

@@ -9,7 +9,7 @@ import requests
 
 from config import GENAI_URL, build_genai_headers, model_registry
 from errors import make_error_chunk
-from tools.parsing import extract_tool_calls
+from tools.parsing import extract_tool_calls, parse_truncated_tool_call
 from tools.prompts import flatten_message_content, normalize_message_content
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,8 @@ TOOL_MARKER_PATTERNS = [
     "<invoke",
     "<tool_call>",          # thinking/parameter tag
     "<|dsml",
-    "ｰ",           # fullwidth horizontal bar used in DSML
+    "ｰ",                # fullwidth horizontal bar used in DSML
+    "〉",                # U+3009 RIGHT CORNER BRACKET (from model output)
 ]
 
 # How many chars to buffer before deciding "this is probably text, not tools"
@@ -96,9 +97,25 @@ def extract_content_from_genai(response_data):
 
 
 def estimate_text_tokens(text):
+    """Estimate token count using a simple heuristic.
+    
+    Uses character-type analysis:
+    - Chinese/CJK chars ≈ 2 tokens each
+    - English/code: ~4 chars per token
+    - This is a rough approximation, not as accurate as tiktoken
+    """
     if not text:
         return 0
-    return len(TOKEN_PATTERN.findall(text))
+    
+    # Count Chinese/CJK characters (typically 2+ tokens each in real tokenizers)
+    chinese_cjk = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]', text))
+    
+    # Other characters (English, code, etc.) - ~4 chars per token
+    other_chars = len(text) - chinese_cjk
+    
+    # Rough estimation
+    estimated = int(chinese_cjk * 2 + other_chars / 4)
+    return max(estimated, 1)  # At least 1 token
 
 
 def log_stream_metrics(model, started_at, first_token_at, content_text, reasoning_text):
@@ -172,6 +189,23 @@ def _split_safe_detection_text(text):
     return text, ""
 
 
+def _calculate_input_tokens(messages):
+    """Calculate total input tokens from all messages."""
+    total = 0
+    for msg in messages:
+        content = ""
+        if isinstance(msg.get("content"), str):
+            content = msg["content"]
+        elif isinstance(msg.get("content"), list):
+            for item in msg["content"]:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    content += item.get("text", "")
+                elif isinstance(item, str):
+                    content += item
+        total += estimate_text_tokens(content)
+    return total
+
+
 def stream_genai_response(chat_info, messages, model, max_tokens, config):
     started_at = time.monotonic()
     first_token_at = None
@@ -182,6 +216,65 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
     headers = build_genai_headers(token)
     normalized_messages = [normalize_message_content(msg) for msg in messages]
 
+    # Calculate input tokens
+    input_tokens = _calculate_input_tokens(normalized_messages)
+
+    # Get model's max tokens from registry (the model's total context window)
+    model_info = model_registry.get_models(token).get(model)
+    model_max_total = getattr(model_info, 'max_tokens', None) if model_info else None
+
+    # Fallback for common models if registry fetch fails
+    MODEL_FALLBACK_LIMITS = {
+        'chatglm': 128000,
+        'gpt-4': 128000,
+        'gpt-3.5': 16385,
+        'claude': 200000,
+        'deepseek': 64000,
+        'MiniMax': 245000,
+    }
+
+    # Use larger default context window: 200000 (instead of 128000)
+    LARGE_CONTEXT_DEFAULT = 200000
+
+    if model_max_total and model_max_total > 0:
+        # Model's total context window
+        total_context = model_max_total
+    else:
+        # Try fallback based on model name
+        fallback = None
+        for key, val in MODEL_FALLBACK_LIMITS.items():
+            if key.lower() in model.lower():
+                fallback = val
+                break
+        total_context = fallback or LARGE_CONTEXT_DEFAULT
+        if not fallback:
+            logger.warning("Model %s has unknown context limit, using %d", model, total_context)
+
+    # Calculate max output tokens:
+    # maxToken = min(requested_max, total_context - input_tokens)
+    # Reserve at least 1000 tokens for output
+    requested_max = max_tokens or total_context
+    max_output = min(requested_max, total_context - input_tokens)
+    max_output = max(max_output, 1000)  # Minimum 1000 output tokens
+
+    # Check if tools are being used (be more generous with output)
+    has_tool_calls = any(
+        msg.get('role') == 'assistant' and 'tool_calls' in msg
+        for msg in messages
+    )
+    if has_tool_calls:
+        # Tools might need more output for parameters
+        max_output = max(max_output, 5000)
+        logger.debug("Tool calls detected, increased min output to 5000")
+
+    # Also cap at 95% of total context as safety (increased from 80%)
+    max_output = min(max_output, int(total_context * 0.95))
+
+    logger.info(
+        "Token calc: input=%d, model_max=%s, total_context=%d, max_output=%d",
+        input_tokens, model_max_total, total_context, max_output
+    )
+
     genai_data = {
         "chatInfo": "",
         "messages": normalized_messages,
@@ -189,9 +282,9 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
         "stream": True,
         "aiType": model,
         "aiSecType": "1",
-        "promptTokens": 0,
+        "promptTokens": input_tokens,
         "rootAiType": root_ai_type,
-        "maxToken": max_tokens or 30000
+        "maxToken": max_output
     }
 
     logger.debug("=== GenAI Request ===")
@@ -209,7 +302,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
             headers=headers,
             json=genai_data,
             stream=True,
-            timeout=120
+            timeout=300
         )
 
         logger.debug("GenAI Response Status: %d", response.status_code)
@@ -631,6 +724,17 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
                     yield chunk
                 return  # Done — tool calls emitted
 
+            # Try truncated parse (for incomplete tool calls)
+            tool_calls, remaining = parse_truncated_tool_call(buffer, allowed_tool_names)
+            if tool_calls:
+                logger.warning("Parsed %d truncated tool_call(s) from buffer (%d chars) — content may be incomplete", len(tool_calls), len(buffer))
+                role_chunk = _send_role()
+                if role_chunk:
+                    yield role_chunk
+                for chunk in _emit_tool_call_chunks(completion_id, created, model, tool_calls, remaining):
+                    yield chunk
+                return  # Done — partial tool calls emitted
+
             # Not yet complete, keep buffering
             continue
 
@@ -666,6 +770,17 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         tool_calls, remaining = _try_parse_tool_calls_from_buffer(buffer, allowed_tool_names)
         if tool_calls:
             logger.debug("Final parse: %d tool_call(s) from buffer (%d chars)", len(tool_calls), len(buffer))
+            role_chunk = _send_role()
+            if role_chunk:
+                yield role_chunk
+            for chunk in _emit_tool_call_chunks(completion_id, created, model, tool_calls, remaining):
+                yield chunk
+            return
+
+        # Try truncated parse (for incomplete tool calls)
+        tool_calls, remaining = parse_truncated_tool_call(buffer, allowed_tool_names)
+        if tool_calls:
+            logger.warning("Final parse (truncated): %d tool_call(s) from buffer (%d chars) — content may be incomplete", len(tool_calls), len(buffer))
             role_chunk = _send_role()
             if role_chunk:
                 yield role_chunk
