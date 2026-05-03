@@ -24,8 +24,9 @@ CRITICAL FORMAT RULES:
 3. NEVER use formats like: terminal〉command〉ls (fullwidth brackets)
 4. NEVER use JSON-only tool calls without XML wrapper
 5. NEVER wrap tool calls in markdown code blocks like ```xml or ```json
-6. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
-7. If you made tool calls and received results, you MUST respond with either more tool calls or a final answer."""
+6. **ALWAYS close all XML tags properly.** Do not truncate or leave tags incomplete.
+7. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
+8. If you made tool calls and received results, you MUST respond with either more tool calls or a final answer."""
 
 
 TOOL_CHOICE_REQUIRED_PROMPT = "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
