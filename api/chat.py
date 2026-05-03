@@ -101,16 +101,13 @@ def _looks_like_mid_sentence(text):
     return MID_SENTENCE_ENDINGS.search(stripped) is None
 
 
-def _trim_conversation(messages, keep_last_n=6):
-    system_msgs = [msg for msg in messages if msg.get('role') == 'system']
-    other_msgs = [msg for msg in messages if msg.get('role') != 'system']
-    filtered = [
-        msg for msg in other_msgs
-        if msg.get('content') not in (TOOL_EMPTY_NUDGE, CONTINUATION_PROMPT)
-    ]
-    if len(filtered) > keep_last_n:
-        filtered = filtered[-keep_last_n:]
-    return system_msgs + filtered
+def _count_nudge_messages(messages):
+    count = 0
+    for msg in messages:
+        content = msg.get('content', '')
+        if content in (TOOL_EMPTY_NUDGE, CONTINUATION_PROMPT):
+            count += 1
+    return count
 
 
 def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools, allowed_tool_names, max_retries):
@@ -148,7 +145,7 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
                     yield chunk
                 return
             continuation_msg = f"{CONTINUATION_PROMPT}\n\n[Partial response]:\n{all_content}"
-            current_messages = _trim_conversation(current_messages, keep_last_n=8)
+            # Removed trimming: just append directly
             current_messages.append({"role": "user", "content": continuation_msg})
             continue
 
@@ -159,14 +156,9 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
                     "Model returned no content after %d retries — attempting clean reset",
                     max_retries,
                 )
-                clean_messages = _trim_conversation(current_messages, keep_last_n=4)
-                if clean_messages == current_messages:
-                    logger.error("All retries failed. Returning empty response.")
-                    yield make_error_chunk("Model returned empty response after retries", model)
-                    return
-
-                logger.warning("Attempting clean reset with trimmed history")
-                current_messages = clean_messages
+                # Removed trimming: use current_messages as is
+                logger.warning("Attempting clean reset (without trimming)")
+                # Add a reset prompt
                 current_messages.append({"role": "user", "content": "Please respond to the tool results above with your analysis or next action."})
 
                 if has_tools:
@@ -189,13 +181,8 @@ def _stream_with_retry(chat_info, messages, model, max_tokens, config, has_tools
                 return
 
             logger.warning("Empty streaming response — retrying (%d/%d)", total_retries, max_retries)
-            if total_retries == 1:
-                nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
-                current_messages.append({"role": "user", "content": nudge})
-            else:
-                current_messages = _trim_conversation(current_messages, keep_last_n=6)
-                nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
-                current_messages.append({"role": "user", "content": nudge})
+            nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
+            current_messages.append({"role": "user", "content": nudge})
             continue
 
     logger.error("Exited retry loop unexpectedly. Returning what we have.")
@@ -258,9 +245,7 @@ def chat_completions():
             request_id, model, stream, bool(has_tools), len(messages), max_tokens, tool_choice_mode
         )
 
-        if len(messages) > 20:
-            logger.warning("[%s] Long conversation detected (%d messages) - trimming proactively", request_id, len(messages))
-            messages = _trim_conversation(messages, keep_last_n=18)
+        # Removed proactive trimming (the if len(messages) > 20 block)
 
         if has_tools:
             messages = inject_tool_prompt(messages, tools, tool_choice)
@@ -318,7 +303,7 @@ def chat_completions():
                                 "Response truncated (finish_reason='length') - requesting continuation (%d/%d)",
                                 total_retries, MAX_EMPTY_RETRIES
                             )
-                            current_messages = _trim_conversation(current_messages, keep_last_n=8)
+                            # Removed trimming: just append directly
                             current_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                             continue
                         else:
@@ -328,16 +313,8 @@ def chat_completions():
 
                 total_retries += 1
                 if total_retries > MAX_EMPTY_RETRIES:
-                    clean_messages = _trim_conversation(current_messages, keep_last_n=4)
-                    if clean_messages == current_messages:
-                        logger.error("Model returned no content after all retries.")
-                        return openai_error(
-                            "Model returned empty response after multiple retries",
-                            code="empty_response",
-                            status=502,
-                        )
-                    logger.warning("Non-streaming: attempting clean reset with trimmed history")
-                    current_messages = clean_messages
+                    # Clean reset without trimming
+                    logger.warning("Non-streaming: attempting clean reset (without trimming)")
                     current_messages.append({"role": "user", "content": "Please respond to the tool results above."})
                     reset_content = ""
                     reset_finish = "stop"
@@ -370,8 +347,6 @@ def chat_completions():
                     )
 
                 logger.warning("Empty response from model — retrying (%d/%d)", total_retries, MAX_EMPTY_RETRIES)
-                if total_retries > 1:
-                    current_messages = _trim_conversation(current_messages, keep_last_n=6)
                 nudge = TOOL_EMPTY_NUDGE if has_tools else CONTINUATION_PROMPT
                 current_messages.append({"role": "user", "content": nudge})
 

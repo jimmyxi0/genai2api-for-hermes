@@ -69,6 +69,24 @@ def estimate_text_tokens(text):
     return len(TOKEN_PATTERN.findall(text))
 
 
+def estimate_messages_tokens(messages):
+    """Estimate total tokens in a list of OpenAI-format messages."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += estimate_text_tokens(part.get("text", ""))
+                else:
+                    total += estimate_text_tokens(str(part))
+        elif isinstance(content, str):
+            total += estimate_text_tokens(content)
+        # overhead per message (~4 tokens for role/separators)
+        total += 4
+    return total
+
+
 def log_stream_metrics(model, started_at, first_token_at, content_text, reasoning_text):
     total_elapsed = max(time.monotonic() - started_at, 1e-6)
     content_tokens = estimate_text_tokens(content_text)
@@ -249,6 +267,22 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                         }
                         emitted_done = True
                         yield f"data: {json.dumps(final_response)}\n\n"
+                        # Usage-only chunk with choices=[] per OpenAI streaming spec
+                        prompt_tokens = estimate_messages_tokens(normalized_messages)
+                        completion_tokens = estimate_text_tokens("".join(content_parts)) + estimate_text_tokens("".join(reasoning_parts))
+                        usage_only_chunk = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens
+                            }
+                        }
+                        yield f"data: {json.dumps(usage_only_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
                         break
 
@@ -279,6 +313,22 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                 }]
             }
             yield f"data: {json.dumps(final_response)}\n\n"
+            # Usage-only chunk with choices=[] per OpenAI streaming spec
+            prompt_tokens = estimate_messages_tokens(normalized_messages)
+            completion_tokens = estimate_text_tokens("".join(content_parts)) + estimate_text_tokens("".join(reasoning_parts))
+            usage_only_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion.chunk",
+                "created": int(datetime.now().timestamp()),
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
+            }
+            yield f"data: {json.dumps(usage_only_chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
     except Exception as e:
@@ -297,6 +347,7 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
     tool_buffer = ""
     sent_role = False
     tool_detected = False
+    accumulated_content = ""
 
     def make_chunk(delta, finish_reason=None):
         chunk = {
@@ -313,12 +364,30 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
         return f"data: {json.dumps(chunk)}\n\n"
 
     def emit_text(text):
-        nonlocal sent_role
+        nonlocal sent_role, accumulated_content
+        accumulated_content += text
         delta = {"content": text}
         if not sent_role:
             delta["role"] = "assistant"
             sent_role = True
         return make_chunk(delta)
+
+    def make_usage_only_chunk():
+        """Build a usage-only chunk with choices=[] per OpenAI streaming spec."""
+        prompt_tokens = estimate_messages_tokens(messages)
+        completion_tokens = estimate_text_tokens(accumulated_content)
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }
 
     # Process the stream from the fixed genai response
     for line in stream_genai_response(chat_info, messages, model, max_tokens, config):
@@ -397,11 +466,13 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
                 })
 
             yield make_chunk({}, finish_reason="tool_calls")
+            yield f"data: {json.dumps(make_usage_only_chunk())}\n\n"
             yield "data: [DONE]\n\n"
         else:
             logger.warning("Tool tag detected but parsing failed — emitting as text")
             yield emit_text(tool_buffer)
             yield make_chunk({}, finish_reason="stop")
+            yield f"data: {json.dumps(make_usage_only_chunk())}\n\n"
             yield "data: [DONE]\n\n"
     else:
         if buffer:
@@ -411,4 +482,5 @@ def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, con
             yield make_chunk({"role": "assistant", "content": ""})
 
         yield make_chunk({}, finish_reason="stop")
+        yield f"data: {json.dumps(make_usage_only_chunk())}\n\n"
         yield "data: [DONE]\n\n"
