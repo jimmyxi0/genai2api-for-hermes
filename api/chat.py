@@ -13,6 +13,7 @@ from tools.parsing import extract_tool_calls
 from provider.genai import (
     convert_messages_to_genai_format,
     estimate_text_tokens,
+    estimate_messages_tokens,
     stream_genai_response,
     stream_genai_response_with_tools,
     MAX_EMPTY_RETRIES,
@@ -24,6 +25,34 @@ from config import model_registry
 logger = logging.getLogger(__name__)
 
 chat_bp = Blueprint('chat', __name__)
+
+# Monotonicity tracker: ensures prompt_tokens never decreases within a conversation.
+# Keyed by conversation identifier derived from first user message + model + tools.
+_last_prompt_tokens = {}
+
+
+def _conversation_key(messages, model, tools=None):
+    """Derive a stable conversation key from the first user message + model + tools.
+    
+    Tools are included in the key because they affect prompt_tokens estimation.
+    Without this, changing tools between turns would break monotonicity tracking.
+    """
+    # Build a tools signature from function names only (stable, order-independent)
+    tools_sig = ""
+    if tools:
+        tool_names = sorted([
+            t.get("function", {}).get("name", "")
+            for t in tools
+            if t.get("type") == "function" and t.get("function", {}).get("name")
+        ])
+        tools_sig = ":" + ",".join(tool_names)
+    
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return f"{model}:{content[:80]}{tools_sig}"
+    return f"{model}:empty{tools_sig}"
 
 MID_SENTENCE_ENDINGS = re.compile(
     r'[.。!！?？\n:：;；\)）\]】』》""…\u2026\w]$'
@@ -373,6 +402,24 @@ def chat_completions():
                     "content": complete_content
                 }
 
+            # Compute prompt tokens from ORIGINAL messages with proper estimation
+            # (not from json.dumps which double-counts structural characters)
+            prompt_tokens = estimate_messages_tokens(messages, tools=tools)
+
+            # Monotonicity: prompt_tokens should never decrease within a conversation
+            conv_key = _conversation_key(messages, model, tools)
+            if conv_key in _last_prompt_tokens:
+                prompt_tokens = max(prompt_tokens, _last_prompt_tokens[conv_key])
+            _last_prompt_tokens[conv_key] = prompt_tokens
+
+            # Prune old conversation keys to avoid memory leak
+            if len(_last_prompt_tokens) > 1000:
+                keys = list(_last_prompt_tokens.keys())
+                for k in keys[:500]:
+                    del _last_prompt_tokens[k]
+
+            completion_tokens = estimate_text_tokens(complete_content)
+
             response = {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -384,9 +431,9 @@ def chat_completions():
                     "finish_reason": finish_reason
                 }],
                 "usage": {
-                    "prompt_tokens": estimate_text_tokens(json.dumps(messages)),
-                    "completion_tokens": estimate_text_tokens(complete_content),
-                    "total_tokens": estimate_text_tokens(json.dumps(messages)) + estimate_text_tokens(complete_content)
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
                 }
             }
             return jsonify(response)
