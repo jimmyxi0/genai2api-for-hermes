@@ -14,21 +14,22 @@ from tools.prompts import flatten_message_content, normalize_message_content
 from provider.chat_group import default_manager as chat_group_manager
 
 logger = logging.getLogger(__name__)
-# Token estimation regex - each match = ~1 token
-# Chinese chars: 1 token each
-# ASCII: 1 token per char (not grouped - the + causes severe undercounting)
-# Fallback: any non-whitespace
-TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]|[^\s]")
+# Token estimation regex - balanced for accuracy
+# Chinese chars: each = ~1 token
+# ASCII: split into word-like chunks (not entire runs)
+# This matches: individual Chinese chars, then ASCII words/symbols
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z][A-Za-z0-9_]*|[0-9]+|[^\s]")
+
+# Safety multiplier for token estimation
+# Our regex approximates real tokenizers:
+#   - Chinese: 1 char = 1 token (accurate)
+#   - English: ~1 word = 1 token (close to cl100k_base)
+# Using 1.3x as safety buffer for edge cases
+TOKEN_ESTIMATE_SAFETY_MULTIPLIER = 1.3
+
 MAX_EMPTY_RETRIES = 10
 CONTINUATION_PROMPT = "Please continue from where you left off. Do not repeat previous content."
 TOOL_EMPTY_NUDGE = "You did not call any tool. Please call at least one tool from the provided list."
-
-# Safety multiplier for token estimation
-# Our regex counts each char as 1 token:
-#   - English: overestimates (~4 chars = 1 real token, we count 4)
-#   - Chinese: accurate (~1 char = 1 token)
-# Using 1.2x as small safety buffer for edge cases (code, special chars, etc.)
-TOKEN_ESTIMATE_SAFETY_MULTIPLIER = 1.2
 
 
 def sanitize_json_string(s: str) -> str:

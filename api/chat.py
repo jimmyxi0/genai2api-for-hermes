@@ -425,7 +425,7 @@ def chat_completions():
 
             # Compute prompt tokens from ORIGINAL messages with proper estimation
             # (not from json.dumps which double-counts structural characters)
-            prompt_tokens = estimate_messages_tokens(messages, tools=tools)
+            prompt_tokens = estimate_messages_tokens(messages)
 
             # Monotonicity: prompt_tokens should never decrease within a conversation
             conv_key = _conversation_key(messages, model, tools)
