@@ -244,8 +244,18 @@ def chat_completions():
 
         # ---- dynamic max_tokens limit ----
         model_max_limit = get_model_max_tokens(model, config)
+        
+        # Estimate prompt tokens to reserve space for completion
+        # This prevents truncation when prompt + completion exceeds context window
+        prompt_tokens_est = estimate_messages_tokens(messages)
+        
         if max_tokens is None:
-            max_tokens = model_max_limit
+            # Default: use model limit, but cap completion to 50% of remaining context
+            if model_max_limit:
+                remaining = int((model_max_limit - prompt_tokens_est) * 0.5)
+                max_tokens = max(100, remaining)  # At least 100 tokens for response
+            else:
+                max_tokens = 4096  # Safe default
         else:
             if model_max_limit is not None and max_tokens > model_max_limit:
                 logger.warning(
@@ -253,6 +263,17 @@ def chat_completions():
                     max_tokens, model_max_limit, model
                 )
                 max_tokens = model_max_limit
+            
+            # Warn if prompt + requested completion exceeds model limit
+            if model_max_limit and (prompt_tokens_est + max_tokens) > model_max_limit:
+                logger.warning(
+                    "[%s] Prompt (%d est tokens) + max_tokens (%d) exceeds model limit (%d). "
+                    "Response may be truncated.",
+                    request_id, prompt_tokens_est, max_tokens, model_max_limit
+                )
+                # Cap max_tokens to fit within remaining context
+                max_tokens = max(100, model_max_limit - prompt_tokens_est)
+        
         max_tokens = max(1, max_tokens)
 
         has_tools = tools and len(tools) > 0

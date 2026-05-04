@@ -14,10 +14,21 @@ from tools.prompts import flatten_message_content, normalize_message_content
 from provider.chat_group import default_manager as chat_group_manager
 
 logger = logging.getLogger(__name__)
-TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]")
+# Token estimation regex - each match = ~1 token
+# Chinese chars: 1 token each
+# ASCII: 1 token per char (not grouped - the + causes severe undercounting)
+# Fallback: any non-whitespace
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]|[^\s]")
 MAX_EMPTY_RETRIES = 10
 CONTINUATION_PROMPT = "Please continue from where you left off. Do not repeat previous content."
 TOOL_EMPTY_NUDGE = "You did not call any tool. Please call at least one tool from the provided list."
+
+# Safety multiplier for token estimation
+# Our regex counts each char as 1 token:
+#   - English: overestimates (~4 chars = 1 real token, we count 4)
+#   - Chinese: accurate (~1 char = 1 token)
+# Using 1.2x as small safety buffer for edge cases (code, special chars, etc.)
+TOKEN_ESTIMATE_SAFETY_MULTIPLIER = 1.2
 
 
 def sanitize_json_string(s: str) -> str:
@@ -133,7 +144,9 @@ def extract_content_from_genai(response_data):
 def estimate_text_tokens(text):
     if not text:
         return 0
-    return len(TOKEN_PATTERN.findall(text))
+    raw_count = len(TOKEN_PATTERN.findall(text))
+    # Apply safety multiplier to account for heuristic undercounting
+    return int(raw_count * TOKEN_ESTIMATE_SAFETY_MULTIPLIER)
 
 
 def estimate_messages_tokens(messages):
@@ -267,8 +280,10 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
 
                     if "choices" in genai_json and len(genai_json["choices"]) > 0:
                         choice = genai_json["choices"][0]
-                        if choice.get("finish_reason") is not None:
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason is not None:
                             finished = True
+                            logger.info("Upstream finish_reason=%s, total_chars=%d", finish_reason, len("".join(content_parts)))
 
                     content, reasoning = extract_content_from_genai(genai_json)
                     delta = {}
@@ -335,7 +350,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
                         break
 
                 except json.JSONDecodeError as e:
-                    logger.debug("JSON decode error: %s, line: %s", e, line_str[:200])
+                    logger.warning("JSON decode error in upstream stream chunk: %s, line: %s", e, line_str[:200])
                 except Exception as e:
                     logger.exception("Unexpected error during stream parsing")
 
